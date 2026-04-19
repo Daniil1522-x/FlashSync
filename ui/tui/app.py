@@ -1,32 +1,37 @@
 """
-ui/tui/app.py — Textual TUI для FlashSync.
+ui/tui/app.py — FlashSync TUI
 """
 from __future__ import annotations
-
 import asyncio
 from pathlib import Path
 from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.widgets import (
     Header, Footer, DataTable, Tree, Label,
-    Button, Input, Static, ProgressBar, Log, Checkbox,
+    Button, Input, Static, Log, Checkbox, RichLog,
 )
 from textual import work, on
 from textual.screen import ModalScreen
 from rich.text import Text
 
-from domain.models import (
-    SyncAction, ActionType, SyncProfile, SyncReport, ProtectionLevel
-)
+from domain.models import SyncAction, ActionType, SyncProfile, SyncReport, ProtectionLevel
+from ui.tui.file_manager import FileManagerScreen
 from application.differ import DiffEngine, summarize_plan
 from infrastructure.scanner import scan_directory, get_directory_stats
-from infrastructure.storage import load_profiles, save_profiles, save_report, setup_logger
+from infrastructure.storage import load_profiles, save_profiles, save_report, setup_logger, CONFIG_DIR
 
+# ── Отображение действий ──────────────────────────────────────────────────────
 
-# ── Цвета Textual (только ansi_* или hex) ────────────────────────────────────
+ACTION_LABEL = {
+    ActionType.COPY_NEW:       "НОВЫЙ",
+    ActionType.COPY_UPDATE:    "ИЗМЕНЁН",
+    ActionType.DELETE:         "ТОЛЬКО В DST",
+    ActionType.SKIP_EQUAL:     "одинаковый",
+    ActionType.SKIP_PROTECTED: "ЗАЩИЩЁН",
+}
 ACTION_STYLE = {
     ActionType.COPY_NEW:       "ansi_bright_green",
     ActionType.COPY_UPDATE:    "ansi_yellow",
@@ -34,12 +39,13 @@ ACTION_STYLE = {
     ActionType.SKIP_EQUAL:     "ansi_bright_black",
     ActionType.SKIP_PROTECTED: "ansi_cyan",
 }
-ACTION_ICON = {
-    ActionType.COPY_NEW:       "+",
-    ActionType.COPY_UPDATE:    "~",
-    ActionType.DELETE:         "-",
-    ActionType.SKIP_EQUAL:     "=",
-    ActionType.SKIP_PROTECTED: "L",
+# Что БУДЕТ сделано — для понятного объяснения в таблице
+ACTION_WILL_DO = {
+    ActionType.COPY_NEW:       "скопировать в dst",
+    ActionType.COPY_UPDATE:    "обновить (старый → backup)",
+    ActionType.DELETE:         "переместить в backup",
+    ActionType.SKIP_EQUAL:     "ничего (одинаковые)",
+    ActionType.SKIP_PROTECTED: "пропустить (защищён)",
 }
 
 
@@ -49,15 +55,15 @@ class ConfirmDialog(ModalScreen):
     CSS = """
     ConfirmDialog { align: center middle; }
     #dlg {
-        width: 64; height: 14;
+        width: 70; min-height: 16;
         border: thick $primary;
         background: $surface;
         padding: 2 3;
     }
-    #dlg Label { margin-bottom: 2; }
-    #dlg Button { margin: 0 1; }
+    #dlg Label { margin-bottom: 1; }
+    #dlg Horizontal { height: 3; }
+    #dlg Button { margin: 0 2; }
     """
-
     def __init__(self, message: str, double_confirm: bool = False):
         super().__init__()
         self.message = message
@@ -77,7 +83,7 @@ class ConfirmDialog(ModalScreen):
             self._count += 1
             if self._count < 2:
                 self.query_one("#msg", Label).update(
-                    "ВТОРОЕ ПОДТВЕРЖДЕНИЕ!\n" + self.message
+                    "[bold red]ВТОРОЕ ПОДТВЕРЖДЕНИЕ ТРЕБУЕТСЯ![/]\n\n" + self.message
                 )
                 return
         self.dismiss(True)
@@ -93,14 +99,31 @@ class SettingsScreen(ModalScreen):
     CSS = """
     SettingsScreen { align: center middle; }
     #sc {
-        width: 72; height: 20;
+        width: 90%;           /* было: 80 */
+        min-height: 35;       /* было: 30 */
+        max-height: 90%;      /* ← новое: не выше 90% экрана */
         border: thick $primary;
         background: $surface;
         padding: 1 2;
     }
-    Input { margin-bottom: 1; }
+    #sc Label.hint { 
+        color: $text-muted; 
+        margin-bottom: 1;
+        text-wrap: wrap;      /* ← новое: перенос длинных подсказок */
+    }
+    Input { 
+        margin-bottom: 1;
+        width: 100%;
+    }
+    #sc .row { 
+        height: auto; 
+        margin-bottom: 1; 
+    }
+    Checkbox {
+        text-wrap: wrap;      /* ← новое: перенос текста чекбоксов */
+        margin-bottom: 1;
+    }
     """
-
     def __init__(self, profiles: dict, current: SyncProfile):
         super().__init__()
         self.profiles = profiles
@@ -108,30 +131,40 @@ class SettingsScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Container(id="sc"):
-            yield Label("Настройки профиля")
-            yield Input(value=self.current.src, placeholder="Источник (src)", id="inp-src")
-            yield Input(value=self.current.dst, placeholder="Приёмник (dst)", id="inp-dst")
-            with Horizontal():
-                yield Checkbox("SHA-256", value=self.current.use_hash, id="chk-hash")
-                yield Checkbox("Удалять из dst", value=self.current.delete_mode, id="chk-del")
-                yield Checkbox("Игн. скрытые", value=self.current.ignore_hidden, id="chk-hid")
-            with Horizontal():
+            yield Label("[bold]Настройки профиля[/]")
+            yield Label("")
+            yield Label("Источник (откуда копировать):", classes="hint")
+            yield Input(value=self.current.src, placeholder="E:\\FLASH", id="inp-src")
+            yield Label("Приёмник (куда копировать):", classes="hint")
+            yield Input(value=self.current.dst, placeholder="E:\\Backup\\Flash", id="inp-dst")
+            yield Label("")
+            yield Label("[bold]Параметры:[/]", classes="hint")
+            yield Checkbox(
+                "SHA-256: сравнивать по содержимому (медленнее, но точно). "
+                "Выкл = только по размеру и дате",
+                value=self.current.use_hash, id="chk-hash"
+            )
+            yield Checkbox(
+                "Удалять из приёмника: файлы, которых нет в источнике → в backup",
+                value=self.current.delete_mode, id="chk-del"
+            )
+            yield Checkbox(
+                "Игнорировать скрытые: .DS_Store, Thumbs.db, файлы с точки",
+                value=self.current.ignore_hidden, id="chk-hid"
+            )
+            yield Label("")
+            with Horizontal(classes="row"):
                 yield Button("Сохранить", variant="success", id="btn-save")
                 yield Button("Отмена", variant="default", id="btn-cancel")
 
     @on(Button.Pressed, "#btn-save")
     def _save(self):
-        # Берём значение напрямую — без Path() обёртки, чтобы не дублировать диск
-        src_val = self.query_one("#inp-src", Input).value.strip()
-        dst_val = self.query_one("#inp-dst", Input).value.strip()
-
-        # Нормализуем на случай если пользователь вставил с дублем
         from infrastructure.storage import _normalize_path
-        self.current.src = _normalize_path(src_val)
-        self.current.dst = _normalize_path(dst_val)
-        self.current.use_hash = self.query_one("#chk-hash", Checkbox).value
-        self.current.delete_mode = self.query_one("#chk-del", Checkbox).value
-        self.current.ignore_hidden = self.query_one("#chk-hid", Checkbox).value
+        self.current.src = _normalize_path(self.query_one("#inp-src", Input).value.strip())
+        self.current.dst = _normalize_path(self.query_one("#inp-dst", Input).value.strip())
+        self.current.use_hash     = self.query_one("#chk-hash", Checkbox).value
+        self.current.delete_mode  = self.query_one("#chk-del",  Checkbox).value
+        self.current.ignore_hidden= self.query_one("#chk-hid",  Checkbox).value
         save_profiles(self.profiles)
         self.dismiss(True)
 
@@ -140,22 +173,65 @@ class SettingsScreen(ModalScreen):
         self.dismiss(False)
 
 
+# ── Экран лога Dry Run ────────────────────────────────────────────────────────
+
+class DryRunLogScreen(ModalScreen):
+    CSS = """
+    DryRunLogScreen { align: center middle; }
+    #logbox {
+        width: 90%; height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #logbox RichLog { height: 1fr; }
+    #logbox Button { margin-top: 1; }
+    """
+    def __init__(self, lines: list[str], summary: str):
+        super().__init__()
+        self.lines = lines
+        self.summary = summary
+
+    def compose(self) -> ComposeResult:
+        with Container(id="logbox"):
+            yield Label(f"[bold]Dry Run — что будет выполнено[/]\n{self.summary}")
+            yield RichLog(id="rl", markup=True)
+            yield Button("Закрыть", variant="default", id="close")
+
+    def on_mount(self):
+        rl = self.query_one("#rl", RichLog)
+        for line in self.lines:
+            rl.write(line)
+
+    @on(Button.Pressed, "#close")
+    def _close(self):
+        self.dismiss(None)
+
+
 # ── Панель дерева файлов ──────────────────────────────────────────────────────
 
 class FileTreePanel(Container):
     DEFAULT_CSS = """
-    FileTreePanel { width: 28; border: solid $accent; background: $surface-darken-1; }
-    FileTreePanel #ftitle { background: $accent; color: $background; text-align: center; height: 1; }
+    FileTreePanel {
+        width: 25%;
+        min-width: 20;
+        border: solid $accent;
+        background: $surface-darken-1;
+    }
+    FileTreePanel #ftitle {
+        background: $accent; color: $background;
+        text-align: center; height: 1;
+    }
+    FileTreePanel Tree { height: 1fr; }
     """
-
     def compose(self) -> ComposeResult:
-        yield Label(" Источник ", id="ftitle")
+        yield Label(" Содержимое источника ", id="ftitle")
         yield Tree("...", id="ftree")
 
     def load_path(self, path: Path) -> None:
         tree = self.query_one("#ftree", Tree)
         tree.clear()
-        tree.root.label = f"[{path.name}]"
+        tree.root.label = f"{path.name}"
         tree.root.data = path
         self._add(tree.root, path, 0)
         tree.root.expand()
@@ -167,42 +243,59 @@ class FileTreePanel(Container):
             entries = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
         except (PermissionError, OSError):
             return
-        for e in entries[:40]:
+        for e in entries[:50]:
             if e.name.startswith("."):
                 continue
             if e.is_dir():
-                child = node.add(f"D {e.name}", data=e)
+                child = node.add(f"[папка] {e.name}", data=e)
                 self._add(child, e, depth + 1)
             else:
                 node.add_leaf(f"  {e.name}", data=e)
 
 
-# ── Панель статистики ─────────────────────────────────────────────────────────
+# ── Правая панель: статистика + лог ──────────────────────────────────────────
 
-class StatsPanel(Container):
+class InfoPanel(Container):
     DEFAULT_CSS = """
-    StatsPanel { width: 32; border: solid $primary; background: $surface-darken-1; padding: 1; }
+    InfoPanel {
+        width: 25%;
+        min-width: 22;
+        border: solid $primary;
+        background: $surface-darken-1;
+        padding: 0;
+    }
+    InfoPanel #stats-label { padding: 0 1; height: auto; }
+    InfoPanel #divider { color: $text-muted; padding: 0 1; height: 1; }
+    InfoPanel RichLog { height: 1fr; padding: 0 1; }
     """
-
     def compose(self) -> ComposeResult:
-        yield Label("Статистика", id="stitle")
-        yield Static("", id="scontent")
-        yield Label("─" * 28)
-        yield Log(id="slog", max_lines=80)
+        yield Label("", id="stats-label")
+        yield Label("── Лог операций ──", id="divider")
+        yield RichLog(id="log-view", markup=True, max_lines=200)
 
-    def update_stats(self, stats: dict) -> None:
+    def update_stats(self, stats: dict, profile: SyncProfile) -> None:
         mb = stats.get("total_size", 0) / (1024 * 1024)
         lines = [
-            f"Файлов: {stats.get('total_files', 0):,}",
-            f"Размер: {mb:.1f} MB",
-            "─" * 26,
+            f"[bold]Источник:[/] {Path(profile.src).name}",
+            f"Файлов:  {stats.get('total_files', 0):,}",
+            f"Размер:  {mb:.1f} MB",
+            "─" * 22,
         ]
-        for cat, cnt in sorted(stats.get("categories", {}).items(), key=lambda x: -x[1])[:6]:
+        for cat, cnt in sorted(stats.get("categories", {}).items(), key=lambda x: -x[1])[:5]:
             lines.append(f"  {cat:<10} {cnt:>4}")
-        self.query_one("#scontent", Static).update("\n".join(lines))
+        lines.append(f"─" * 22)
+        lines.append(f"[dim]Лог: {CONFIG_DIR}[/]")
+        self.query_one("#stats-label", Label).update("\n".join(lines))
 
-    def log(self, msg: str) -> None:
-        self.query_one("#slog", Log).write_line(msg)
+    def log(self, msg: str, style: str = "") -> None:
+        rl = self.query_one("#log-view", RichLog)
+        if style:
+            rl.write(f"[{style}]{msg}[/]")
+        else:
+            rl.write(msg)
+
+    def clear_log(self) -> None:
+        self.query_one("#log-view", RichLog).clear()
 
 
 # ── Главное приложение ────────────────────────────────────────────────────────
@@ -212,31 +305,60 @@ class FlashSyncApp(App):
 
     CSS = """
     Screen { background: $background; }
+
     #toolbar {
-        layout: horizontal;
-        height: 3;
-        background: $surface-darken-2;
-        padding: 0 1;
-        align: left middle;
+    layout: horizontal;
+    height: auto;        /* было: height: 3 */
+    min-height: 3;
+    background: $surface-darken-2;
+    padding: 0 1;
+    align: left middle;
     }
-    #toolbar Button { margin: 0 1; min-width: 14; }
+
+    #toolbar Button {
+        margin: 0 1;
+        min-width: 0; /* ✅ Разрешаем кнопкам сжиматься */
+    }
+    #direction-lbl {
+    color: $text-muted;
+    margin: 0 2;
+    width: auto;         /* было: 1fr */
+    text-wrap: wrap;     /* Разрешаем перенос */
+    overflow-x: hidden;
+    text-overflow: ellipsis; /* ✅ Ставит ... если путь слишком длинный */
+    }
+
     #main-layout { layout: horizontal; height: 1fr; }
-    #center { width: 1fr; border: solid $primary; background: $surface; }
+
+    #center {
+        width: 1fr;
+        border: solid $primary;
+        background: $surface;
+    }
+
+    #legend {
+        height: 2;
+        background: $surface-darken-1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
     #plan-table { height: 1fr; }
+
     #statusbar {
-        height: 3;
+        height: 2;
         background: $surface-darken-2;
         padding: 0 1;
-        layout: horizontal;
         align: left middle;
     }
-    #statusbar #slabel { width: 1fr; color: $text-muted; }
+    #statusbar #slabel { width: 1fr; }
     """
 
     BINDINGS = [
         Binding("ctrl+s", "scan",     "Сканировать",      show=True),
         Binding("ctrl+r", "run_sync", "Синхронизировать", show=True),
-        Binding("ctrl+d", "dry_run",  "Dry Run",          show=True),
+        Binding("ctrl+d", "dry_run",  "Пред_запуск(без.изм)", show=True),
+        Binding("ctrl+f", "file_mgr", "Файлы",            show=True),
         Binding("ctrl+p", "settings", "Настройки",        show=True),
         Binding("ctrl+q", "quit",     "Выход",            show=True),
     ]
@@ -247,35 +369,53 @@ class FlashSyncApp(App):
         self.current_profile: SyncProfile = list(self.profiles.values())[0]
         self.logger = setup_logger()
         self._plan: list[SyncAction] = []
+        self._last_dry_run_report: Optional[SyncReport] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical():
+            # ── Toolbar ──
             with Horizontal(id="toolbar"):
-                yield Button("Сканировать", id="btn-scan", variant="primary")
-                yield Button("Синхронизировать", id="btn-sync", variant="success")
-                yield Button("Dry Run", id="btn-dry", variant="warning")
-                yield Button("Обратить src<->dst", id="btn-rev", variant="default")
-                yield Button("Настройки", id="btn-cfg", variant="default")
-                yield Label("", id="profile-lbl")
+                yield Button("Сканировать [^S]",      id="btn-scan", variant="primary")
+                yield Button("Синхронизировать [^R]", id="btn-sync", variant="success")
+                yield Button("Dry Run [^D]",          id="btn-dry",  variant="warning")
+                yield Button("Управление файлами [^F]", id="btn-fm", variant="default")
+                yield Button("Обратить src<->dst",    id="btn-rev",  variant="default")
+                yield Button("Настройки [^P]",        id="btn-cfg",  variant="default")
+                yield Label("", id="direction-lbl")
+
+            # ── Основной layout ──
             with Horizontal(id="main-layout"):
                 yield FileTreePanel(id="src-tree")
                 with Vertical(id="center"):
+                    # Легенда прямо в интерфейсе
+                    yield Label(
+                        "[ansi_bright_green]● НОВЫЙ[/]  "
+                        "[ansi_yellow]● ИЗМЕНЕН.Backup[/]  "
+                        "[ansi_red]● ПРИЕМНИК→Backup[/]  "
+                        "[ansi_cyan]● ЗАЩИЩЁН[/]  "
+                        "[ansi_bright_black]● ОДИНАКОВЫЙ[/]",
+                        id="legend"
+                    )
                     yield DataTable(id="plan-table", cursor_type="row")
-                yield StatsPanel(id="stats")
+                yield InfoPanel(id="info")
+
         with Horizontal(id="statusbar"):
-            yield Label("Готов", id="slabel")
+            yield Label("Готов. Нажмите Сканировать (Ctrl+S)", id="slabel")
         yield Footer()
 
     def on_mount(self) -> None:
         t = self.query_one("#plan-table", DataTable)
-        t.add_columns(" ", "Действие", "Файл", "Размер", "Причина")
-        self._update_profile_label()
+        t.add_columns("Действие", "Что будет сделано", "Файл", "Размер")
+        self._update_direction_label()
 
-    def _update_profile_label(self) -> None:
+    def _update_direction_label(self) -> None:
         p = self.current_profile
-        self.query_one("#profile-lbl", Label).update(
-            f"  [{p.name}]  {p.src} -> {p.dst}"
+        src = Path(p.src).name or p.src
+        dst = Path(p.dst).name or p.dst
+        # Убрали пробелы и двоеточия — экономим 6-8 символов
+        self.query_one("#direction-lbl", Label).update(
+            f"[bold]ОТКУДА[/]{src}→[bold]КУДА[/]{dst}"
         )
 
     # ── Кнопки ───────────────────────────────────────────────────────────────
@@ -293,43 +433,67 @@ class FlashSyncApp(App):
     def _reverse(self):
         p = self.current_profile
         p.src, p.dst = p.dst, p.src
-        self._update_profile_label()
-        self.notify("src <-> dst поменяны местами")
+        self._update_direction_label()
+        self.notify(
+            f"Направление изменено!\n"
+            f"Теперь копируем:\n{p.src}\n→ {p.dst}",
+            severity="information",
+            timeout=5,
+        )
+
+    @on(Button.Pressed, "#btn-fm")
+    def action_file_mgr(self):
+        if not self._plan:
+            self.notify("Сначала нажмите Сканировать (Ctrl+S)", severity="warning")
+            return
+        self.push_screen(
+            FileManagerScreen(self._plan, self.current_profile),
+            self._on_file_mgr_closed
+        )
+
+    def _on_file_mgr_closed(self, new_plan) -> None:
+        if new_plan is not None:
+            self._plan = new_plan
+            # ✅ ПРЯМОЙ вызов — мы уже в главном потоке
+            self._fill_table(self._plan)
+            self.notify("Изменения применены к плану", severity="information")
 
     @on(Button.Pressed, "#btn-cfg")
     def action_settings(self):
         self.push_screen(
             SettingsScreen(self.profiles, self.current_profile),
-            self._on_settings_closed
+            self._on_settings_saved
         )
 
-    def _on_settings_closed(self, saved: bool) -> None:
+    def _on_settings_saved(self, saved: bool) -> None:
         if saved:
-            self._update_profile_label()
-            self.notify("Профиль сохранён")
+            self._update_direction_label()
+            self.notify("Профиль сохранён", severity="information")
 
     # ── Сканирование ─────────────────────────────────────────────────────────
 
     @work(thread=True, exclusive=True)
     def _do_scan(self) -> None:
         self.call_from_thread(self._set_status, "Сканирование...")
+        self.call_from_thread(self.query_one("#info", InfoPanel).clear_log)
+
         p = self.current_profile
         src = Path(p.src)
         dst = Path(p.dst)
 
         if not src.exists():
-            self.call_from_thread(self.notify, f"Источник не найден: {src}", severity="error")
-            self.call_from_thread(self._set_status, "Ошибка: источник не найден")
+            self.call_from_thread(self.notify, f"Источник не найден:\n{src}", severity="error")
+            self.call_from_thread(self._set_status, f"Ошибка: источник не найден — {src}")
             return
 
         try:
             dst.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self.call_from_thread(self.notify, f"Ошибка dst: {e}", severity="error")
+            self.call_from_thread(self.notify, f"Ошибка создания dst:\n{e}", severity="error")
             self.call_from_thread(self._set_status, f"Ошибка dst: {e}")
             return
 
-        self.call_from_thread(self._set_status, "Сканирование источника...")
+        self.call_from_thread(self._set_status, f"Сканирование источника: {src}")
         src_tree = scan_directory(
             src,
             include_patterns=p.include_patterns or None,
@@ -338,7 +502,7 @@ class FlashSyncApp(App):
             ignore_hidden=p.ignore_hidden,
         )
 
-        self.call_from_thread(self._set_status, "Сканирование приёмника...")
+        self.call_from_thread(self._set_status, f"Сканирование приёмника: {dst}")
         dst_tree = scan_directory(
             dst,
             include_patterns=p.include_patterns or None,
@@ -347,7 +511,7 @@ class FlashSyncApp(App):
             ignore_hidden=p.ignore_hidden,
         )
 
-        self.call_from_thread(self._set_status, "Построение плана...")
+        self.call_from_thread(self._set_status, "Построение плана изменений...")
         engine = DiffEngine(p)
         self._plan = engine.compute_plan(src_tree, dst_tree)
 
@@ -356,31 +520,38 @@ class FlashSyncApp(App):
 
         try:
             stats = get_directory_stats(src)
-            self.call_from_thread(self.query_one("#stats", StatsPanel).update_stats, stats)
+            self.call_from_thread(
+                self.query_one("#info", InfoPanel).update_stats, stats, p
+            )
         except Exception:
             pass
 
         try:
-            self.call_from_thread(self.query_one("#src-tree", FileTreePanel).load_path, src)
+            self.call_from_thread(
+                self.query_one("#src-tree", FileTreePanel).load_path, src
+            )
         except Exception:
             pass
 
         c = summary["counts"]
         mb = summary["bytes_to_copy"] / (1024 * 1024)
-        msg = (
-            f"Готово | "
-            f"+{c.get('copy_new', 0)} новых  "
-            f"~{c.get('copy_update', 0)} обновить  "
-            f"-{c.get('delete', 0)} удалить  "
-            f"={c.get('skip_equal', 0)} одинаковых  "
-            f"| {mb:.1f} MB"
+        method = "SHA-256" if p.use_hash else "размер+дата"
+        status = (
+            f"Сканирование завершено [{method}] | "
+            f"Новых: {c.get('copy_new', 0)}  "
+            f"Изменённых: {c.get('copy_update', 0)}  "
+            f"Только в dst: {c.get('delete', 0)}  "
+            f"Одинаковых: {c.get('skip_equal', 0)}  "
+            f"Защищённых: {c.get('skip_protected', 0)}  "
+            f"| К копированию: {mb:.1f} MB"
         )
-        self.call_from_thread(self._set_status, msg)
-        self.call_from_thread(
-            self.query_one("#stats", StatsPanel).log,
-            f"src:{len(src_tree)} dst:{len(dst_tree)} план:{len(self._plan)}"
-        )
-        self.logger.info(f"Scan done: src={len(src_tree)} dst={len(dst_tree)}")
+        self.call_from_thread(self._set_status, status)
+
+        # Лог
+        info = self.query_one("#info", InfoPanel)
+        self.call_from_thread(info.log, f"Сканирование: src={len(src_tree)} файлов, dst={len(dst_tree)} файлов")
+        self.call_from_thread(info.log, f"Новых: {c.get('copy_new',0)}  Изменённых: {c.get('copy_update',0)}  В backup: {c.get('delete',0)}")
+        self.logger.info(f"Scan: src={len(src_tree)} dst={len(dst_tree)} plan={len(self._plan)}")
 
     def _fill_table(self, plan: list[SyncAction]) -> None:
         t = self.query_one("#plan-table", DataTable)
@@ -388,24 +559,24 @@ class FlashSyncApp(App):
         for a in plan:
             if a.action == ActionType.SKIP_EQUAL:
                 continue
-            icon = ACTION_ICON[a.action]
-            style = ACTION_STYLE[a.action]
-            rel = str(a.rel_path)
-            if len(rel) > 55:
-                rel = "..." + rel[-52:]
+            style  = ACTION_STYLE[a.action]
+            label  = ACTION_LABEL[a.action]
+            will   = ACTION_WILL_DO[a.action]
+            rel    = str(a.rel_path)
+            if len(rel) > 60:
+                rel = "..." + rel[-57:]
             t.add_row(
-                Text(icon, style=style),
-                Text(a.action.value, style=style),
+                Text(label, style=style),
+                Text(will,  style=style),
                 Text(rel),
                 Text(_fmt_size(a.size_bytes)),
-                Text(a.reason[:38]),
             )
 
     # ── Синхронизация ─────────────────────────────────────────────────────────
 
     def _start_sync(self, dry_run: bool) -> None:
         if not self._plan:
-            self.notify("Сначала нажмите Сканировать", severity="warning")
+            self.notify("Сначала нажмите Сканировать (Ctrl+S)", severity="warning")
             return
 
         active = [a for a in self._plan if a.action not in (
@@ -413,7 +584,7 @@ class FlashSyncApp(App):
         )]
 
         if not active:
-            self.notify("Нет изменений для синхронизации", severity="information")
+            self.notify("Нет изменений — всё актуально.", severity="information")
             return
 
         needs_double = any(
@@ -422,8 +593,30 @@ class FlashSyncApp(App):
             for a in active
         )
 
-        prefix = "[DRY RUN] " if dry_run else ""
-        msg = f"{prefix}Выполнить {len(active)} операций?"
+        p = self.current_profile
+        n_copy = sum(1 for a in active if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE))
+        n_del  = sum(1 for a in active if a.action == ActionType.DELETE)
+        mb     = sum(a.size_bytes for a in active if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE)) / (1024*1024)
+
+        if dry_run:
+            msg = (
+                f"[bold]DRY RUN — симуляция без изменений[/]\n\n"
+                f"Источник: {p.src}\n"
+                f"Приёмник: {p.dst}\n\n"
+                f"Будет скопировано/обновлено: {n_copy} файлов ({mb:.1f} MB)\n"
+                f"Будет перемещено в backup:   {n_del} файлов\n\n"
+                f"Запустить симуляцию?"
+            )
+        else:
+            msg = (
+                f"[bold]Подтвердите синхронизацию[/]\n\n"
+                f"Источник: {p.src}\n"
+                f"Приёмник: {p.dst}\n\n"
+                f"Скопировать/обновить: {n_copy} файлов ({mb:.1f} MB)\n"
+                f"Переместить в backup: {n_del} файлов\n\n"
+                f"Продолжить?"
+            )
+
         self.push_screen(
             ConfirmDialog(msg, double_confirm=needs_double),
             lambda ok: self._run_sync_worker(ok, active, dry_run)
@@ -437,10 +630,12 @@ class FlashSyncApp(App):
         from application.sync_engine import SyncEngine
 
         p = self.current_profile
+        info = self.query_one("#info", InfoPanel)
 
         def on_progress(action: SyncAction, msg: str) -> None:
-            self.call_from_thread(self._set_status, msg)
-            self.call_from_thread(self.query_one("#stats", StatsPanel).log, msg)
+            style = ACTION_STYLE.get(action.action, "")
+            self.call_from_thread(self._set_status, msg[:100])
+            self.call_from_thread(info.log, msg, style)
 
         engine = SyncEngine(
             profile=p,
@@ -452,7 +647,6 @@ class FlashSyncApp(App):
 
         report = SyncReport()
         try:
-            # Создаём новый event loop в этом потоке (Textual worker — отдельный поток)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -463,28 +657,45 @@ class FlashSyncApp(App):
             self.call_from_thread(self.notify, f"Ошибка: {e}", severity="error")
             return
 
-        if not dry_run:
+        if dry_run:
+            # Показываем подробный лог dry run в отдельном окне
+            self._last_dry_run_report = report
+            s = report.stats
+            mb_c = report.bytes_copied / (1024*1024)
+            mb_b = report.bytes_backed_up / (1024*1024)
+            summary = (
+                f"Скопировать: {s.get('copy_new',0)} новых + {s.get('copy_update',0)} обновлений "
+                f"({mb_c:.1f} MB)  |  В backup: {s.get('delete',0)} файлов ({mb_b:.1f} MB)"
+            )
+            self.call_from_thread(
+                self.push_screen,
+                DryRunLogScreen(report.log_lines, summary),
+                lambda _: None
+            )
+            self.call_from_thread(self._set_status, f"[DRY RUN] {summary}")
+        else:
             try:
-                save_report(report)
+                rpath = save_report(report)
+                self.call_from_thread(info.log, f"Отчёт сохранён: {rpath}")
             except Exception:
                 pass
 
-        prefix = "[DRY RUN] " if dry_run else ""
-        s = report.stats
-        msg = (
-            f"{prefix}Готово: "
-            f"+{s.get('copy_new', 0)} ~{s.get('copy_update', 0)} -{s.get('delete', 0)}"
-        )
-        self.call_from_thread(self._set_status, msg)
+            s = report.stats
+            msg = (
+                f"Готово: скопировано {s.get('copy_new',0)} новых, "
+                f"обновлено {s.get('copy_update',0)}, "
+                f"в backup {s.get('delete',0)}"
+            )
+            self.call_from_thread(self._set_status, msg)
 
-        if report.errors:
-            self.call_from_thread(
-                self.notify, f"Завершено с {len(report.errors)} ошибками", severity="warning"
-            )
-        else:
-            self.call_from_thread(
-                self.notify, f"{prefix}Синхронизация завершена!", severity="information"
-            )
+            if report.errors:
+                self.call_from_thread(
+                    self.notify,
+                    f"Завершено с {len(report.errors)} ошибками. Смотрите лог.",
+                    severity="warning"
+                )
+            else:
+                self.call_from_thread(self.notify, "Синхронизация завершена!", severity="information")
 
     def _set_status(self, msg: str) -> None:
         try:
@@ -492,8 +703,6 @@ class FlashSyncApp(App):
         except Exception:
             pass
 
-
-# ── Утилиты ───────────────────────────────────────────────────────────────────
 
 def _fmt_size(size: int) -> str:
     for unit in ("B", "K", "M", "G"):

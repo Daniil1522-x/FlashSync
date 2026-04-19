@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+MTIME_TOLERANCE = 2.0  # секунды
+
 
 class ActionType(Enum):
     COPY_NEW       = "copy_new"
@@ -49,9 +51,10 @@ class FileInfo:
         return datetime.fromtimestamp(self.mtime)
 
     def is_same_as(self, other: "FileInfo", use_hash: bool = True) -> bool:
-        if use_hash and self.hash and other.hash:
+        if use_hash and self.hash is not None and other.hash is not None:
             return self.hash == other.hash
-        return self.size == other.size and abs(self.mtime - other.mtime) < 2.0
+        # fallback: размер + дата
+        return self.size == other.size and abs(self.mtime - other.mtime) < MTIME_TOLERANCE
 
 
 @dataclass
@@ -66,7 +69,7 @@ class SyncAction:
     @property
     def rel_path(self) -> Path:
         f = self.src_file or self.dst_file
-        assert f is not None
+        assert f is not None, "SyncAction: нет ни src_file ни dst_file"
         return f.rel_path
 
     @property
@@ -81,6 +84,7 @@ class SyncAction:
         return self.protection_level != ProtectionLevel.NONE
 
     def confirm(self) -> bool:
+        """True = достаточно подтверждений для выполнения."""
         self.confirmed += 1
         return self.confirmed >= self.protection_level.value
 
@@ -89,11 +93,11 @@ class SyncAction:
 class SyncReport:
     started_at: datetime = field(default_factory=datetime.now)
     finished_at: Optional[datetime] = None
-    actions_planned: list[SyncAction] = field(default_factory=list)
     actions_done: list[SyncAction] = field(default_factory=list)
     actions_skipped: list[SyncAction] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    log_lines: list[str] = field(default_factory=list)   # строки для Dry Run лога
     bytes_copied: int = 0
     bytes_backed_up: int = 0
 
@@ -111,6 +115,9 @@ class SyncReport:
             counter[key] = counter.get(key, 0) + 1
         return counter
 
+    def add_log(self, line: str) -> None:
+        self.log_lines.append(line)
+
 
 @dataclass
 class ProtectionRule:
@@ -120,10 +127,15 @@ class ProtectionRule:
 
     def matches(self, rel_path: Path) -> bool:
         import fnmatch
-        name = str(rel_path).lower()
+        # as_posix() — всегда прямые слеши, работает на Windows и Linux одинаково
+        name = rel_path.as_posix().lower()
         pat = self.pattern.lower()
         if "*" in pat or "?" in pat or "[" in pat:
+            if "/" not in pat:
+                # паттерн без слеша — сравниваем только имя файла
+                return fnmatch.fnmatch(rel_path.name.lower(), pat)
             return fnmatch.fnmatch(name, pat)
+        # простое вхождение
         return pat in name
 
 
