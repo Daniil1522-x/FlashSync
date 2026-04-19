@@ -1,26 +1,17 @@
 """
 application/differ.py — Движок сравнения двух каталогов.
-Принимает два словаря {rel_path: FileInfo} и генерирует список SyncAction.
 """
 from __future__ import annotations
-
 from pathlib import Path
-from typing import Optional
-
 from domain.models import (
     FileInfo, SyncAction, ActionType,
-    ProtectionLevel, ProtectionRule, SyncProfile,
+    ProtectionLevel, SyncProfile,
 )
 
 
 class DiffEngine:
-    """
-    Сравнивает src_tree и dst_tree, возвращает план синхронизации.
-    """
-
     def __init__(self, profile: SyncProfile):
         self.profile = profile
-        self._protection_rules = profile.protection_rules
 
     def compute_plan(
         self,
@@ -28,42 +19,37 @@ class DiffEngine:
         dst_tree: dict[Path, FileInfo],
     ) -> list[SyncAction]:
         actions: list[SyncAction] = []
-
         src_keys = set(src_tree.keys())
         dst_keys = set(dst_tree.keys())
 
-        # ── 1. Файлы в src ──────────────────────────────────────────────
         for rel in sorted(src_keys):
             src_f = src_tree[rel]
             protection = self._get_protection(rel)
 
             if rel not in dst_keys:
-                # Нового файла нет в dst → скопировать
                 actions.append(SyncAction(
                     action=ActionType.COPY_NEW,
                     src_file=src_f,
                     dst_file=None,
-                    reason="only in source",
+                    reason="только в источнике",
                     protection_level=ProtectionLevel.NONE,
                 ))
             else:
                 dst_f = dst_tree[rel]
                 if src_f.is_same_as(dst_f, use_hash=self.profile.use_hash):
-                    # Идентичны → пропустить
                     actions.append(SyncAction(
                         action=ActionType.SKIP_EQUAL,
                         src_file=src_f,
                         dst_file=dst_f,
-                        reason="files are identical",
+                        reason="файлы идентичны",
                     ))
                 else:
-                    # Файл изменился
                     if protection != ProtectionLevel.NONE:
                         actions.append(SyncAction(
                             action=ActionType.SKIP_PROTECTED,
                             src_file=src_f,
                             dst_file=dst_f,
-                            reason=f"protected ({protection.name})",
+                            reason=f"защищён ({protection.name})",
                             protection_level=protection,
                         ))
                     else:
@@ -71,10 +57,9 @@ class DiffEngine:
                             action=ActionType.COPY_UPDATE,
                             src_file=src_f,
                             dst_file=dst_f,
-                            reason=f"src newer/different (src={src_f.size}b, dst={dst_f.size}b)",
+                            reason=f"изменён (src={src_f.size}b dst={dst_f.size}b)",
                         ))
 
-        # ── 2. Файлы только в dst ────────────────────────────────────────
         if self.profile.delete_mode:
             for rel in sorted(dst_keys - src_keys):
                 dst_f = dst_tree[rel]
@@ -84,38 +69,35 @@ class DiffEngine:
                         action=ActionType.SKIP_PROTECTED,
                         src_file=None,
                         dst_file=dst_f,
-                        reason="double-protected, cannot delete",
+                        reason="двойная защита — удаление запрещено",
                         protection_level=protection,
                     ))
                 elif protection == ProtectionLevel.SINGLE:
                     actions.append(SyncAction(
-                        action=ActionType.DELETE,
+                        action=ActionType.SKIP_PROTECTED,
                         src_file=None,
                         dst_file=dst_f,
-                        reason="only in dest (will move to backup)",
-                        protection_level=ProtectionLevel.SINGLE,
+                        reason="одиночная защита — удаление пропущено",
+                        protection_level=protection,
                     ))
                 else:
                     actions.append(SyncAction(
                         action=ActionType.DELETE,
                         src_file=None,
                         dst_file=dst_f,
-                        reason="only in dest (will move to backup)",
+                        reason="только в приёмнике → backup",
                     ))
 
         return actions
 
     def _get_protection(self, rel_path: Path) -> ProtectionLevel:
-        level = ProtectionLevel.NONE
-        for rule in self._protection_rules:
-            if rule.matches(rel_path):
-                if rule.level.value > level.value:
-                    level = rule.level
-        return level
+        levels = [rule.level for rule in self.profile.protection_rules if rule.matches(rel_path)]
+        if not levels:
+            return ProtectionLevel.NONE
+        return max(levels, key=lambda lv: lv.value)
 
 
 def summarize_plan(actions: list[SyncAction]) -> dict:
-    """Возвращает краткую статистику по плану."""
     counts: dict[str, int] = {}
     bytes_to_copy = 0
     bytes_to_delete = 0
