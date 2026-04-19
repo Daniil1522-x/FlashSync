@@ -1,0 +1,68 @@
+# ========================================
+# FlashSync — Recommended .gitignore
+# ========================================
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Project specific
+.flashsync/           # конфиг + логи + отчёты
+test_data/            # тестовые данные (можно закоммитить, если хочешь)
+dist/                 # собранные exe
+build/
+
+# Logs and reports
+*.log
+audit_report_*.txt
+report_*.txt
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# uv / pip
+uv.lock
+.pip/
+.cache/
+
+# Optional: большие файлы
+*.zip
+*.7z
+*.rar
