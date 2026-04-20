@@ -66,3 +66,6 @@ uv.lock
 *.zip
 *.7z
 *.rar
+
+err.txt
+simple_scanner.py

@@ -116,7 +116,7 @@ flashsync.exe --cli    # CLI меню
 
 ## Настройки профиля
 
-Профиль хранится в файле `~/.flashsync/config.json`.
+Профиль хранится в файле `C:\Users\ИМЯ\.flashsync\config.json` (Windows) или `~/.flashsync/config.json` (Linux).
 
 | Параметр | Описание |
 |----------|----------|
@@ -140,7 +140,7 @@ flashsync.exe --cli    # CLI меню
 | `*backup*`    | SINGLE | Требует 1 подтверждение |
 | `*final*`     | SINGLE | Требует 1 подтверждение |
 
-Правила можно редактировать в `~/.flashsync/config.json`.
+Правила можно редактировать в `C:\Users\ИМЯ\.flashsync\config.json` (Windows) или `~/.flashsync/config.json` (Linux).
 
 ---
 
@@ -190,3 +190,25 @@ pytest tests/ -v
 - [ ] Поддержка нескольких профилей в TUI
 - [ ] Прогресс-бар при копировании больших файлов
 - [ ] Экспорт плана в CSV/HTML
+
+---
+
+## Где хранятся файлы программы
+
+На **Windows**:
+```
+C:\Users\ВашеИмя\.flashsync\
+    config.json      — профили синхронизации
+    flashsync.log    — журнал работы
+    reports\         — отчёты синхронизации
+```
+
+На **Linux/macOS**:
+```
+~/.flashsync/
+    config.json
+    flashsync.log
+    reports/
+```
+
+Путь также отображается в правой панели интерфейса.
