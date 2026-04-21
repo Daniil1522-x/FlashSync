@@ -72,7 +72,7 @@ def _profile_from_dict(d: dict) -> SyncProfile:
 
 
 def _normalize_path(path_str: str) -> str:
-    """Убирает дублирование буквы диска Windows: E:\E:\... → E:\..."""
+    """Убирает дублирование буквы диска Windows: E:\\E:\\... -> E:\\..."""
     if not path_str:
         return path_str
     # Паттерн E:\E:\ → убираем дубль
@@ -147,8 +147,9 @@ def save_report(report: SyncReport, out_path: Optional[Path] = None) -> Path:
         f.write(f"FlashSync Report — {report.started_at:%Y-%m-%d %H:%M:%S}\n")
         f.write("=" * 70 + "\n\n")
         f.write(f"Длительность: {report.duration_seconds:.1f}с\n")
-        f.write(f"Скопировано: {report.bytes_copied:,} байт\n")
-        f.write(f"В backup:    {report.bytes_backed_up:,} байт\n\n")
+        f.write(f"Скопировано:     {report.bytes_copied:,} байт\n")
+        f.write(f"В backup:        {report.bytes_backed_up:,} байт\n")
+
         f.write("Статистика:\n")
         for k, v in report.stats.items():
             f.write(f"  {k}: {v}\n")

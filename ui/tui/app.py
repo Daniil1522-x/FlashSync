@@ -115,9 +115,13 @@ class SettingsScreen(ModalScreen):
                 yield Label("[bold]Настройки профиля[/]")
                 yield Label("")
                 yield Label("Источник — откуда копировать (флешка, папка):", classes="hint")
-                yield Input(value=self.current.src, placeholder="E:\\FLASH", id="inp-src")
+                with Horizontal(classes="row"):
+                    yield Input(value=self.current.src, placeholder="E:\\FLASH", id="inp-src")
+                    yield Button("Выбрать...", id="btn-pick-src", variant="default")
                 yield Label("Приёмник — куда копировать (папка на ПК):", classes="hint")
-                yield Input(value=self.current.dst, placeholder="E:\\Backup\\Flash", id="inp-dst")
+                with Horizontal(classes="row"):
+                    yield Input(value=self.current.dst, placeholder="E:\\Backup\\Flash", id="inp-dst")
+                    yield Button("Выбрать...", id="btn-pick-dst", variant="default")
                 yield Label("")
                 yield Label("[bold]Параметры сравнения:[/]", classes="hint")
                 yield Checkbox(
@@ -134,6 +138,24 @@ class SettingsScreen(ModalScreen):
                 with Horizontal(classes="row"):
                     yield Button("Сохранить", variant="success", id="btn-save")
                     yield Button("Отмена", variant="default", id="btn-cancel")
+
+    @on(Button.Pressed, "#btn-pick-src")
+    def _pick_src(self):
+        from ui.tui.folder_picker import FolderPickerScreen
+        cur = self.query_one("#inp-src", Input).value
+        self.app.push_screen(FolderPickerScreen("Выберите источник", cur),
+                             lambda p: self._set_inp("inp-src", p))
+
+    @on(Button.Pressed, "#btn-pick-dst")
+    def _pick_dst(self):
+        from ui.tui.folder_picker import FolderPickerScreen
+        cur = self.query_one("#inp-dst", Input).value
+        self.app.push_screen(FolderPickerScreen("Выберите приёмник", cur),
+                             lambda p: self._set_inp("inp-dst", p))
+
+    def _set_inp(self, inp_id: str, path) -> None:
+        if path:
+            self.query_one(f"#{inp_id}", Input).value = str(path)
 
     @on(Button.Pressed, "#btn-save")
     def _save(self):
@@ -297,6 +319,7 @@ class ProfilesScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Container(id="ps"):
             yield Label("[bold]Профили синхронизации[/]")
+            yield Label("[dim]Двойной клик = выбрать профиль[/]")
             yield DataTable(id="prof-table", cursor_type="row")
             yield Label("")
             yield Label("Имя нового профиля:")
@@ -317,7 +340,9 @@ class ProfilesScreen(ModalScreen):
         t.clear()
         for name, p in self._profiles.items():
             mark = "★" if name == self._current else " "
-            t.add_row(mark, name, p.src[-30:], p.dst[-30:], key=name)
+            src_show = ("..." + p.src[-27:]) if len(p.src) > 30 else p.src
+            dst_show = ("..." + p.dst[-27:]) if len(p.dst) > 30 else p.dst
+            t.add_row(mark, name, src_show, dst_show, key=name)
 
     @on(Button.Pressed, "#btn-new")
     def _new(self) -> None:
@@ -357,6 +382,13 @@ class ProfilesScreen(ModalScreen):
             if self._current == name:
                 self._current = "default"
             self._refresh()
+
+    @on(DataTable.RowSelected, "#prof-table")
+    def _row_selected(self, event) -> None:
+        if event.cursor_row >= 0:
+            row = self.query_one("#prof-table", DataTable).get_row_at(event.cursor_row)
+            self._current = row[1]
+            self.dismiss(self._current)
 
     @on(Button.Pressed, "#btn-close")
     def _close(self): self.dismiss(self._current)
@@ -597,16 +629,15 @@ class FlashSyncApp(App):
         yield Header()
         with Vertical():
             with Horizontal(id="toolbar"):
-                yield Button("Скан",      id="btn-scan", variant="primary")
-                yield Button("Синхр",     id="btn-sync", variant="success")
-                yield Button("Dry Run",            id="btn-dry",  variant="warning")
+                yield Button("Сканировать",  id="btn-scan", variant="primary")
+                yield Button("Синхр-ть",     id="btn-sync", variant="success")
+                yield Button("Dry Run",      id="btn-dry",  variant="warning")
                 yield Button("Файлы",     id="btn-fm",   variant="default")
-                yield Button("↔ src/dst", id="btn-rev",  variant="default")
-                yield Button("Источник",  id="btn-drive",variant="default")
+                yield Button("↔ Обратить",  id="btn-rev",  variant="default")
                 yield Button("Профили",   id="btn-prof", variant="default")
                 yield Button("История",   id="btn-hist", variant="default")
                 yield Button("Backup",    id="btn-bkp",  variant="default")
-                yield Button("Настр.",    id="btn-cfg",  variant="default")
+                yield Button("Настройки",    id="btn-cfg",  variant="default")
                 yield Label("", id="direction-lbl")
             with Horizontal(id="main-layout"):
                 yield FileTreePanel(id="src-tree")
@@ -752,14 +783,32 @@ class FlashSyncApp(App):
             return
 
         self.call_from_thread(self._set_progress, 10, 100, "Сканирование источника...")
+        _src_count = [0]
+        def _src_cb(path):
+            _src_count[0] += 1
+            if _src_count[0] % 20 == 0:
+                self.call_from_thread(
+                    self._set_status,
+                    f"Сканирование источника: {_src_count[0]} файлов... {path.name}"
+                )
         src_tree = scan_directory(src, include_patterns=p.include_patterns or None,
                                   exclude_patterns=p.exclude_patterns,
-                                  use_hash=p.use_hash, ignore_hidden=p.ignore_hidden)
+                                  use_hash=p.use_hash, ignore_hidden=p.ignore_hidden,
+                                  progress_cb=_src_cb)
 
         self.call_from_thread(self._set_progress, 40, 100, "Сканирование приёмника...")
+        _dst_count = [0]
+        def _dst_cb(path):
+            _dst_count[0] += 1
+            if _dst_count[0] % 20 == 0:
+                self.call_from_thread(
+                    self._set_status,
+                    f"Сканирование приёмника: {_dst_count[0]} файлов... {path.name}"
+                )
         dst_tree = scan_directory(dst, include_patterns=p.include_patterns or None,
                                   exclude_patterns=p.exclude_patterns,
-                                  use_hash=p.use_hash, ignore_hidden=p.ignore_hidden)
+                                  use_hash=p.use_hash, ignore_hidden=p.ignore_hidden,
+                                  progress_cb=_dst_cb)
 
         self.call_from_thread(self._set_progress, 70, 100, "Построение плана...")
         engine = DiffEngine(p)
@@ -785,7 +834,7 @@ class FlashSyncApp(App):
             f"[{method}]  "
             f"Новых: {c.get('copy_new', 0)}  "
             f"Изменённых: {c.get('copy_update', 0)}  "
-            f"Только в dst: {c.get('delete', 0)}  "
+            f"В backup: {c.get('delete', 0)}  "
             f"Одинаковых: {c.get('skip_equal', 0)}  "
             f"Защищённых: {c.get('skip_protected', 0)}  "
             f"| {mb:.1f} MB к копированию"

@@ -77,6 +77,10 @@ def scan_directory(
             except OSError:
                 continue
 
+            # Сообщаем о файле сразу (до хеширования) для отзывчивого UI
+            if progress_cb:
+                progress_cb(full_path)
+
             file_hash: Optional[str] = None
             if use_hash:
                 file_hash = hash_file(full_path, hash_algo.value)
@@ -91,9 +95,6 @@ def scan_directory(
                 mtime=stat.st_mtime,
                 hash=file_hash,
             )
-
-            if progress_cb:
-                progress_cb(full_path)
 
     return result
 

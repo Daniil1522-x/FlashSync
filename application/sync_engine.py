@@ -8,6 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+try:
+    from send2trash import send2trash
+    USE_TRASH = True
+except ImportError:
+    USE_TRASH = False
+
 from domain.models import SyncAction, ActionType, SyncReport, SyncProfile
 
 
@@ -162,7 +168,7 @@ class SyncEngine:
                             report.actions_done.append(action)
                             report.bytes_backed_up += action.size_bytes
                             try:
-                                dst_path.unlink(missing_ok=True)
+                                await asyncio.to_thread(dst_path.unlink, missing_ok=True)
                             except OSError as e:
                                 report.warnings.append(f"Не удалось удалить после backup {rel}: {e}")
                         else:
@@ -172,6 +178,33 @@ class SyncEngine:
                     async with self._report_lock:
                         report.actions_done.append(action)
                         report.bytes_backed_up += action.size_bytes
+
+            elif action.action == ActionType.DELETE_PERM:
+                msg = f"{prefix}УДАЛЕНИЕ    {rel}  (в корзину/безвозвратно)"
+                self._emit(action, msg)
+                report.add_log(f"  🗑 {msg}")
+                if not self.dry_run:
+                    dst_path = self.dst / rel
+                    try:
+                        if USE_TRASH:
+                            await asyncio.to_thread(send2trash, str(dst_path))
+                        else:
+                            if dst_path.is_dir():
+                                await asyncio.to_thread(shutil.rmtree, dst_path)
+                            else:
+                                await asyncio.to_thread(dst_path.unlink, missing_ok=True)
+
+                        async with self._report_lock:
+                            report.actions_done.append(action)
+                            report.bytes_deleted_perm += action.size_bytes
+                    except Exception as e:
+                        async with self._report_lock:
+                            report.errors.append(f"Ошибка удаления {rel}: {e}")
+                            report.add_log(f"  [ОШИБКА] Не удалось удалить: {rel}")
+                else:
+                    async with self._report_lock:
+                        report.actions_done.append(action)
+                        report.bytes_deleted_perm += action.size_bytes
 
         except Exception as e:
             async with self._report_lock:
