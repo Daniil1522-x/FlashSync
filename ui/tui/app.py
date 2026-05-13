@@ -27,6 +27,7 @@ from infrastructure.storage import (
     setup_logger, CONFIG_DIR, REPORTS_DIR,
 )
 from infrastructure.drives import get_removable_drives
+from application.plan_overrides import PlanOverrides
 from ui.tui.folder_picker import FolderPickerScreen
 
 
@@ -603,6 +604,7 @@ class FlashSyncApp(App):
     #progress-row #prog-label { width: 30; color: $text-muted; }
     #statusbar { height: 2; background: $surface-darken-2; padding: 0 1; align: left middle; }
     #statusbar #slabel { width: 1fr; }
+    #statusbar #ov-count-lbl { color: ansi_cyan; margin: 0 1; }
     """
 
     BINDINGS = [
@@ -614,6 +616,7 @@ class FlashSyncApp(App):
         Binding("ctrl+b", "cleanup",   "Backup",           show=True),
         Binding("ctrl+p", "settings",  "Настройки",        show=True),
         Binding("ctrl+q", "quit",      "Выход",            show=True),
+        Binding("ctrl+e", "reset_ov",  "Сбросить изм.",    show=False),
     ]
 
     def __init__(self):
@@ -624,6 +627,7 @@ class FlashSyncApp(App):
         self._plan: list[SyncAction] = []
         self._total_actions = 0
         self._done_actions = 0
+        self._overrides = PlanOverrides(self.current_profile.name)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -633,6 +637,7 @@ class FlashSyncApp(App):
                 yield Button("Синхр-ть",     id="btn-sync", variant="success")
                 yield Button("Dry Run",      id="btn-dry",  variant="warning")
                 yield Button("Файлы",     id="btn-fm",   variant="default")
+                yield Button("Сбросить",  id="btn-reset-ov", variant="default")
                 yield Button("↔ Обратить",  id="btn-rev",  variant="default")
                 yield Button("Профили",   id="btn-prof", variant="default")
                 yield Button("История",   id="btn-hist", variant="default")
@@ -656,6 +661,7 @@ class FlashSyncApp(App):
             yield Label("", id="prog-label")
         with Horizontal(id="statusbar"):
             yield Label("Готов. Нажмите Сканировать (Ctrl+S)", id="slabel")
+            yield Label("", id="ov-count-lbl")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -716,6 +722,28 @@ class FlashSyncApp(App):
     def action_history(self):
         self.push_screen(HistoryScreen(), lambda _: None)
 
+    @on(Button.Pressed, "#btn-reset-ov")
+    def _reset_overrides(self):
+        n = self._overrides.count()
+        if n == 0:
+            self.notify("Нет сохранённых изменений", severity="information")
+            return
+        self.push_screen(
+            ConfirmDialog(
+                f"Сбросить {n} ручных изменений?\n\n"
+                "После сброса следующее сканирование построит план заново\n"
+                "без учёта ваших ручных настроек защиты и пропусков."
+            ),
+            self._on_reset_confirmed,
+        )
+
+    def _on_reset_confirmed(self, ok: bool) -> None:
+        if ok:
+            n = self._overrides.count()
+            self._overrides.clear()
+            self._update_ov_label()
+            self.notify(f"Сброшено {n} изменений", severity="warning")
+
     @on(Button.Pressed, "#btn-bkp")
     def action_cleanup(self):
         self.push_screen(BackupCleanupScreen(self.current_profile.dst), lambda _: None)
@@ -729,9 +757,25 @@ class FlashSyncApp(App):
 
     def _on_file_mgr_closed(self, new_plan) -> None:
         if new_plan is not None:
+            # Находим что изменилось вручную и сохраняем в overrides
+            old_by_path = {a.rel_path.as_posix(): a for a in self._plan}
+            changed = [
+                a for a in new_plan
+                if a.rel_path.as_posix() in old_by_path
+                and a.action != old_by_path[a.rel_path.as_posix()].action
+            ]
+            if changed:
+                self._overrides.set_many(changed)
+
             self._plan = new_plan
             self._fill_table(self._plan)
-            self.notify("Изменения применены к плану", severity="information")
+            self._update_ov_label()
+            n = len(changed)
+            self.notify(
+                f"Изменения применены ({n} файлов). Сохранены — переживут повторное сканирование.",
+                severity="information",
+                timeout=5,
+            )
 
     def _on_drive_picked(self, path: Optional[str]) -> None:
         if path:
@@ -751,6 +795,8 @@ class FlashSyncApp(App):
     def _on_profile_picked(self, name: Optional[str]) -> None:
         if name and name in self.profiles:
             self.current_profile = self.profiles[name]
+            self._overrides = PlanOverrides(name)
+            self._plan = []
             self._update_direction_label()
             self.notify(f"Профиль: {name}", severity="information")
 
@@ -812,10 +858,27 @@ class FlashSyncApp(App):
 
         self.call_from_thread(self._set_progress, 70, 100, "Построение плана...")
         engine = DiffEngine(p)
-        self._plan = engine.compute_plan(src_tree, dst_tree)
+        raw_plan = engine.compute_plan(src_tree, dst_tree)
+
+        # Применяем ручные переопределения — они переживают повторное сканирование
+        self._plan, applied, stale = self._overrides.apply(raw_plan)
+
+        if applied > 0 or stale > 0:
+            msg_parts = []
+            if applied > 0:
+                msg_parts.append(f"восстановлено {applied} ручных изменений")
+            if stale > 0:
+                msg_parts.append(f"сброшено {stale} устаревших (файлы изменились)")
+            self.call_from_thread(
+                self.notify,
+                "Ручные изменения: " + ", ".join(msg_parts),
+                severity="information",
+                timeout=6,
+            )
 
         summary = summarize_plan(self._plan)
         self.call_from_thread(self._fill_table, self._plan)
+        self.call_from_thread(self._update_ov_label)
 
         try:
             stats = get_directory_stats(src)
@@ -987,6 +1050,18 @@ class FlashSyncApp(App):
             pb = self.query_one("#prog-bar", ProgressBar)
             pb.update(progress=done, total=max(total, 1))
             self.query_one("#prog-label", Label).update(label)
+        except Exception:
+            pass
+
+    def _update_ov_label(self) -> None:
+        """Обновляет счётчик ручных изменений в статус-строке."""
+        try:
+            n = self._overrides.count()
+            lbl = self.query_one("#ov-count-lbl", Label)
+            if n > 0:
+                lbl.update(f"[ansi_cyan]● {n} ручных изм.[/]")
+            else:
+                lbl.update("")
         except Exception:
             pass
 

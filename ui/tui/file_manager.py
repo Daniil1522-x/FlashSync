@@ -115,8 +115,6 @@ class SingleFileActionScreen(ModalScreen):
             yield Button("ПРОПУСТИТЬ — ничего не делать", id="a-skip", variant="default")
             yield Button("ЗАЩИТИТЬ — никогда не трогать", id="a-protect", variant="primary")
             yield Button("В BACKUP — переместить в backup", id="a-backup", variant="error")
-            # Кнопка удаления (одна, без дублей!)
-            yield Button("🗑 УДАЛИТЬ (В корзину)", id="act-delete", variant="error")
             yield Button("Отмена", id="a-cancel", variant="default")
 
     @on(Button.Pressed, "#a-copy")

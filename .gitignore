@@ -69,3 +69,6 @@ uv.lock
 
 err.txt
 simple_scanner.py
+flashsync.spec
+make_sandbox.py
+infrastructure/copier.py
