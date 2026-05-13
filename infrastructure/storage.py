@@ -1,33 +1,45 @@
 """
-infrastructure/storage.py — Хранение профилей и отчётов.
+infrastructure/storage.py — Storage for profiles, config and reports.
 """
-from __future__ import annotations
 
 import json
 import logging
 import os
-from pathlib import Path
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from domain.models import SyncProfile, ProtectionRule, ProtectionLevel, HashAlgo, SyncReport
+from domain.models import (
+    SyncProfile,
+    ProtectionRule,
+    ProtectionLevel,
+    HashAlgo,
+    SyncReport,
+)
 
-CONFIG_DIR  = Path.home() / ".flashsync"
-CONFIG_PATH = CONFIG_DIR / "config.json"
-LOG_PATH    = CONFIG_DIR / "flashsync.log"
-REPORTS_DIR = CONFIG_DIR / "reports"
+# ====================== Paths ======================
+CONFIG_DIR: Path = Path.home() / ".flashsync"
+CONFIG_PATH: Path = CONFIG_DIR / "config.json"
+LOG_PATH: Path = CONFIG_DIR / "flashsync.log"
+REPORTS_DIR: Path = CONFIG_DIR / "reports"
 
 
 def setup_logger() -> logging.Logger:
+    """Setup application logger."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
     logger = logging.getLogger("flashsync")
     logger.setLevel(logging.INFO)
+
     if not logger.handlers:
         fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
         fh.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
         ))
         logger.addHandler(fh)
+
     return logger
 
 
@@ -40,28 +52,38 @@ def _rule_from_dict(d: dict) -> ProtectionRule:
 
 
 def _rule_to_dict(r: ProtectionRule) -> dict:
-    return {"pattern": r.pattern, "level": r.level.value, "description": r.description}
+    return {
+        "pattern": r.pattern,
+        "level": r.level.value,
+        "description": r.description,
+    }
+
+
+def _normalize_path(path_str: str) -> str:
+    """Fix Windows drive letter duplication (E:\\E:\\... → E:\\...)."""
+    if not path_str:
+        return path_str
+    return re.sub(r'^([A-Za-z]:\\)[A-Za-z]:\\', r'\1', path_str)
 
 
 def _profile_from_dict(d: dict) -> SyncProfile:
+    """Convert JSON dict to SyncProfile."""
     try:
         hash_algo = HashAlgo(d.get("hash_algo", "sha256"))
     except ValueError:
         hash_algo = HashAlgo.SHA256
 
-    # ИСПРАВЛЕНИЕ: нормализуем пути — убираем дублирование буквы диска
-    src = _normalize_path(d.get("src", ""))
-    dst = _normalize_path(d.get("dst", ""))
-
     return SyncProfile(
         name=d.get("name", "default"),
-        src=src,
-        dst=dst,
+        src=_normalize_path(d.get("src", "")),
+        dst=_normalize_path(d.get("dst", "")),
         include_patterns=d.get("include_patterns", []),
         exclude_patterns=d.get("exclude_patterns", [
             "*.tmp", "*.log", "*.bak", "thumbs.db", ".ds_store", "desktop.ini"
         ]),
-        protection_rules=[_rule_from_dict(r) for r in d.get("protection_rules", _DEFAULT_RULES)],
+        protection_rules=[
+            _rule_from_dict(r) for r in d.get("protection_rules", _DEFAULT_RULES)
+        ],
         use_hash=d.get("use_hash", True),
         hash_algo=hash_algo,
         delete_mode=d.get("delete_mode", False),
@@ -71,17 +93,8 @@ def _profile_from_dict(d: dict) -> SyncProfile:
     )
 
 
-def _normalize_path(path_str: str) -> str:
-    """Убирает дублирование буквы диска Windows: E:\E:\... → E:\..."""
-    if not path_str:
-        return path_str
-    # Паттерн E:\E:\ → убираем дубль
-    import re
-    fixed = re.sub(r'^([A-Za-z]:\\)[A-Za-z]:\\', r'\1', path_str)
-    return fixed
-
-
 def _profile_to_dict(p: SyncProfile) -> dict:
+    """Convert SyncProfile to dict for JSON storage."""
     return {
         "name": p.name,
         "src": str(p.src),
@@ -99,65 +112,93 @@ def _profile_to_dict(p: SyncProfile) -> dict:
 
 
 _DEFAULT_RULES = [
-    {"pattern": "*important*", "level": 2, "description": "важные файлы"},
-    {"pattern": "*contract*",  "level": 2, "description": "договоры"},
-    {"pattern": "*personal*",  "level": 2, "description": "личные данные"},
-    {"pattern": "*backup*",    "level": 1, "description": "резервные копии"},
-    {"pattern": "*final*",     "level": 1, "description": "финальные версии"},
+    {"pattern": "*important*", "level": 2, "description": "important files"},
+    {"pattern": "*contract*",  "level": 2, "description": "contracts"},
+    {"pattern": "*personal*",  "level": 2, "description": "personal data"},
+    {"pattern": "*backup*",    "level": 1, "description": "backup files"},
+    {"pattern": "*final*",     "level": 1, "description": "final versions"},
 ]
 
 
 def load_profiles() -> dict[str, SyncProfile]:
+    """Load profiles. Create default on first run."""
     if not CONFIG_PATH.exists():
-        default = _make_default_profile()
-        save_profiles({"default": default})
-        return {"default": default}
+        return {"default": _make_default_profile()}
+
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             raw = json.load(f)
         return {name: _profile_from_dict(d) for name, d in raw.items()}
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Error reading config: {e}")
         return {"default": _make_default_profile()}
 
 
 def save_profiles(profiles: dict[str, SyncProfile]) -> None:
+    """Save profiles to config file."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     raw = {name: _profile_to_dict(p) for name, p in profiles.items()}
+
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
 def _make_default_profile() -> SyncProfile:
+    """Create default profile on first launch."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if CONFIG_PATH.exists():
+        return SyncProfile(name="default", src="", dst="")
+
+    # First run defaults
     if os.name == "nt":
         src = r"E:\FLASH"
-        dst = r"E:\IT\Backup\Flash"
+        dst = str(Path.home() / "FlashBackup")
     else:
         src = str(Path.home() / "flash_source")
-        dst = str(Path.home() / "flash_backup")
-    return _profile_from_dict({"name": "default", "src": src, "dst": dst})
+        dst = str(Path.home() / "FlashBackup")
+
+    profile = SyncProfile(
+        name="default",
+        src=src,
+        dst=dst,
+        use_hash=True,
+        delete_mode=False,
+        max_workers=4,
+        ignore_hidden=True,
+    )
+
+    save_profiles({"default": profile})
+    return profile
 
 
 def save_report(report: SyncReport, out_path: Optional[Path] = None) -> Path:
+    """Save sync report to file."""
     if out_path is None:
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = REPORTS_DIR / f"report_{ts}.txt"
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"FlashSync Report — {report.started_at:%Y-%m-%d %H:%M:%S}\n")
         f.write("=" * 70 + "\n\n")
-        f.write(f"Длительность: {report.duration_seconds:.1f}с\n")
-        f.write(f"Скопировано: {report.bytes_copied:,} байт\n")
-        f.write(f"В backup:    {report.bytes_backed_up:,} байт\n\n")
-        f.write("Статистика:\n")
+        f.write(f"Duration:         {report.duration_seconds:.1f}s\n")
+        f.write(f"Copied:           {report.bytes_copied:,} bytes\n")
+        f.write(f"Backed up:        {report.bytes_backed_up:,} bytes\n\n")
+
+        f.write("Statistics:\n")
         for k, v in report.stats.items():
             f.write(f"  {k}: {v}\n")
+
         if report.errors:
-            f.write(f"\nОшибки ({len(report.errors)}):\n")
+            f.write(f"\nErrors ({len(report.errors)}):\n")
             for e in report.errors:
                 f.write(f"  {e}\n")
         if report.warnings:
-            f.write(f"\nПредупреждения:\n")
+            f.write(f"\nWarnings:\n")
             for w in report.warnings:
                 f.write(f"  {w}\n")
+
     return out_path

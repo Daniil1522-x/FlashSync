@@ -206,4 +206,3 @@ class DriveListScreen(ModalScreen):
             self.dismiss(None)
         elif btn_id.startswith("drive-"):
             drive_path = btn_id.replace("drive-", "")
-            self.dismiss(drive_path)
