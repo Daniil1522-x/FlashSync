@@ -8,7 +8,6 @@ scripts/generate_test_data.py — Генератор реалистичных т
   python scripts/generate_test_data.py --small      # быстрый тест
   python scripts/generate_test_data.py --clean      # очистка
 """
-from __future__ import annotations
 
 import argparse
 import os
@@ -18,17 +17,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # ─── Настройки путей ─────────────────────────────────────────────────────────
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 BASE = Path(__file__).parent.parent
+TEST_DATA_DIR = BASE / "test_data"
 
-if os.name == "nt":
-    TEST_SRC = Path(r"E:\IT\Programming\2_tools__utilities__scripts\Scripts\Flash\TEST_SOURCE")
-    TEST_DST = Path(r"E:\IT\Programming\2_tools__utilities__scripts\Scripts\Flash\TEST_DEST")
-else:
-    TEST_SRC = BASE / "test_data" / "SOURCE"
-    TEST_DST = BASE / "test_data" / "DEST"
+TEST_SRC = TEST_DATA_DIR / "SOURCE"
+TEST_DST = TEST_DATA_DIR / "DEST"
 
 # ─── Данные для генерации ────────────────────────────────────────────────────
 CATEGORIES = ["Фото", "Видео", "Документы", "Музыка", "Архивы", "Temp", "Old"]
@@ -49,7 +42,7 @@ SIZE_PRESETS = [10, 50, 200, 1024, 5000]  # KB
 
 def random_date(start_year=2023, end_year=2026) -> datetime:
     start = datetime(start_year, 1, 1)
-    end   = datetime(end_year, 12, 31)
+    end = datetime(end_year, 12, 31)
     return start + timedelta(days=random.randint(0, (end - start).days))
 
 
@@ -78,22 +71,19 @@ def generate(
     files_per_folder: int = 12,
     max_depth: int = 4,
 ) -> None:
-    """
-    Реалистичный сценарий:
-      ~50% файлов одинаковые в src и dst
-      ~45% только в src (будут скопированы)
-      ~5%  только в dst (лишние)
-    """
     print(f"\n🚀 Генерация тестовых данных...")
     print(f"   SRC: {src_root}")
     print(f"   DST: {dst_root}")
 
+    # Предупреждение перед удалением
     for d, name in [(src_root, "SOURCE"), (dst_root, "DEST")]:
         if d.exists():
-            ans = input(f"Удалить существующую {name}? (y/n): ")
-            if ans.lower() == "y":
+            ans = input(f"Удалить существующую {name}? (y/n): ").strip().lower()
+            if ans == "y":
                 shutil.rmtree(d, ignore_errors=True)
                 print(f"  🗑 {name} очищен")
+            else:
+                print(f"  Пропуск удаления {name}")
 
     src_root.mkdir(parents=True, exist_ok=True)
     dst_root.mkdir(parents=True, exist_ok=True)
@@ -132,9 +122,9 @@ def generate(
                 shutil.copy2(src_file, dst_file)
                 created_dst += 1
                 common += 1
-            elif r < 0.95: # только в src (новый)
+            elif r < 0.95:  # только в src
                 pass
-            else:          # только в dst (лишний)
+            else:           # только в dst
                 dst_file = dst_cur / name
                 write_random_file(dst_file, size + random.randint(1, 10))
                 created_dst += 1
@@ -146,34 +136,34 @@ def generate(
     print(f"   SOURCE: {created_src} файлов")
     print(f"   DEST:   {created_dst} файлов")
     print(f"   Общих: ~{common} ({int(common/created_src*100) if created_src else 0}%)")
-    print(f"   Только в SRC: ~{created_src - common}")
-    print(f"   Только в DST: ~{created_dst - common}")
-    print(f"\n   Теперь запускайте: python main.py scan -s {src_root} -d {dst_root}")
+    print(f"\n   Теперь можно запускать:")
+    print(f"   python main.py scan -s \"{src_root}\" -d \"{dst_root}\"")
 
 
 def clean() -> None:
-    for d in [TEST_SRC, TEST_DST]:
+    for d, name in [(TEST_SRC, "SOURCE"), (TEST_DST, "DEST")]:
         if d.exists():
-            shutil.rmtree(d)
+            shutil.rmtree(d, ignore_errors=True)
             print(f"🗑 Удалено: {d}")
         else:
-            print(f"⚠️  Не найдено: {d}")
+            print(f"⚠️  Не найдено: {name}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Генератор тестовых данных FlashSync")
-    parser.add_argument("--src", default=str(TEST_SRC))
-    parser.add_argument("--dst", default=str(TEST_DST))
-    parser.add_argument("--small",  action="store_true", help="Маленький набор")
-    parser.add_argument("--big",    action="store_true", help="Большой набор")
-    parser.add_argument("--clean",  action="store_true", help="Очистить тестовые данные")
+    parser.add_argument("--src", type=Path, default=TEST_SRC, help="Путь к SOURCE")
+    parser.add_argument("--dst", type=Path, default=TEST_DST, help="Путь к DEST")
+    parser.add_argument("--small", action="store_true", help="Маленький набор")
+    parser.add_argument("--big",   action="store_true", help="Большой набор")
+    parser.add_argument("--clean", action="store_true", help="Очистить тестовые данные")
+
     args = parser.parse_args()
 
     if args.clean:
         clean()
     elif args.small:
-        generate(Path(args.src), Path(args.dst), total_folders=5, files_per_folder=6, max_depth=2)
+        generate(args.src, args.dst, total_folders=5, files_per_folder=6, max_depth=2)
     elif args.big:
-        generate(Path(args.src), Path(args.dst), total_folders=50, files_per_folder=25, max_depth=5)
+        generate(args.src, args.dst, total_folders=50, files_per_folder=25, max_depth=5)
     else:
-        generate(Path(args.src), Path(args.dst))
+        generate(args.src, args.dst)
