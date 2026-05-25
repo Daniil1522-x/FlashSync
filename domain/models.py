@@ -1,6 +1,3 @@
-"""
-domain/models.py
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,27 +5,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-MTIME_TOLERANCE = 2.0  # секунды
-
+MTIME_TOLERANCE = 2.0
 
 class ActionType(Enum):
     COPY_NEW       = "copy_new"
     COPY_UPDATE    = "copy_update"
     DELETE         = "delete"
+    DELETE_PERM    = "delete_permanent"
     SKIP_EQUAL     = "skip_equal"
     SKIP_PROTECTED = "skip_protected"
-
 
 class HashAlgo(Enum):
     SHA256 = "sha256"
     MD5    = "md5"
 
-
 class ProtectionLevel(Enum):
     NONE   = 0
     SINGLE = 1
     DOUBLE = 2
-
 
 @dataclass
 class FileInfo:
@@ -53,9 +47,7 @@ class FileInfo:
     def is_same_as(self, other: "FileInfo", use_hash: bool = True) -> bool:
         if use_hash and self.hash is not None and other.hash is not None:
             return self.hash == other.hash
-        # fallback: размер + дата
         return self.size == other.size and abs(self.mtime - other.mtime) < MTIME_TOLERANCE
-
 
 @dataclass
 class SyncAction:
@@ -69,25 +61,27 @@ class SyncAction:
     @property
     def rel_path(self) -> Path:
         f = self.src_file or self.dst_file
-        assert f is not None, "SyncAction: нет ни src_file ни dst_file"
+        assert f is not None
         return f.rel_path
 
     @property
     def size_bytes(self) -> int:
         if self.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE):
             return self.src_file.size if self.src_file else 0
-        if self.action == ActionType.DELETE:
-            return self.dst_file.size if self.dst_file else 0
+        if self.action in (ActionType.DELETE, ActionType.DELETE_PERM):
+            if self.dst_file:
+                return self.dst_file.size
+            if self.src_file:
+                return self.src_file.size
+            return 0
         return 0
 
     def needs_confirmation(self) -> bool:
         return self.protection_level != ProtectionLevel.NONE
 
     def confirm(self) -> bool:
-        """True = достаточно подтверждений для выполнения."""
         self.confirmed += 1
         return self.confirmed >= self.protection_level.value
-
 
 @dataclass
 class SyncReport:
@@ -97,9 +91,10 @@ class SyncReport:
     actions_skipped: list[SyncAction] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    log_lines: list[str] = field(default_factory=list)   # строки для Dry Run лога
+    log_lines: list[str] = field(default_factory=list)
     bytes_copied: int = 0
     bytes_backed_up: int = 0
+    bytes_deleted_perm: int = 0
 
     @property
     def duration_seconds(self) -> float:
@@ -118,7 +113,6 @@ class SyncReport:
     def add_log(self, line: str) -> None:
         self.log_lines.append(line)
 
-
 @dataclass
 class ProtectionRule:
     pattern: str
@@ -127,17 +121,13 @@ class ProtectionRule:
 
     def matches(self, rel_path: Path) -> bool:
         import fnmatch
-        # as_posix() — всегда прямые слеши, работает на Windows и Linux одинаково
         name = rel_path.as_posix().lower()
         pat = self.pattern.lower()
         if "*" in pat or "?" in pat or "[" in pat:
             if "/" not in pat:
-                # паттерн без слеша — сравниваем только имя файла
                 return fnmatch.fnmatch(rel_path.name.lower(), pat)
             return fnmatch.fnmatch(name, pat)
-        # простое вхождение
         return pat in name
-
 
 @dataclass
 class SyncProfile:
@@ -153,7 +143,6 @@ class SyncProfile:
     backup_limit_mb: int = 500
     max_workers: int = 4
     ignore_hidden: bool = True
-
 
 _EXT_MAP = {
     "image":    {".jpg", ".jpeg", ".png", ".heic", ".raw", ".gif", ".bmp", ".webp", ".tiff"},

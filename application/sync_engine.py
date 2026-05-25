@@ -1,52 +1,32 @@
-"""
-application/sync_engine.py — Исполнитель плана синхронизации.
-
-Стратегия копирования:
-  - Маленькие файлы (<4 MB): батчами по 16 штук в одном потоке
-  - Большие файлы (>=4 MB): по одному с прогрессом по байтам
-  - DELETE_PERM удалена из боевого кода — слишком опасно без undo
-"""
 from __future__ import annotations
-
-import asyncio
-import shutil
+import asyncio, shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
-
 from domain.models import SyncAction, ActionType, SyncReport, SyncProfile
-from infrastructure.copier import (
-    copy_file, copy_batch_small, SMALL_FILE_THRESHOLD
-)
+from infrastructure.copier import copy_file, copy_batch_small, SMALL_FILE_THRESHOLD
 
-# send2trash — опциональная зависимость
 try:
     from send2trash import send2trash
     USE_TRASH = True
 except ImportError:
     USE_TRASH = False
 
-BATCH_SIZE = 16   # маленьких файлов в одном пакете
-
+BATCH_SIZE = 16
 
 class SyncEngine:
-    def __init__(
-        self,
-        profile: SyncProfile,
-        src: Path,
-        dst: Path,
-        dry_run: bool = False,
-        progress_cb: Optional[Callable[[SyncAction, str], None]] = None,
-    ):
+    def __init__(self, profile: SyncProfile, src: Path, dst: Path,
+                 dry_run: bool = False,
+                 progress_cb: Optional[Callable[[SyncAction, str], None]] = None,
+                 stop_flag: Optional[Callable[[], bool]] = None):
         self.profile = profile
         self.src = src
         self.dst = dst
         self.dry_run = dry_run
         self.progress_cb = progress_cb
+        self.stop_flag = stop_flag or (lambda: False)
         self._backup_dir: Optional[Path] = None
         self._report_lock: Optional[asyncio.Lock] = None
-
-    # ── Вспомогательные ──────────────────────────────────────────────────────
 
     def _get_backup_dir(self) -> Path:
         if self._backup_dir is None:
@@ -72,187 +52,136 @@ class SyncEngine:
         try:
             await asyncio.to_thread(shutil.copy2, str(file_path), str(dest))
             return True
-        except (OSError, shutil.Error):
+        except Exception:
             return False
 
-    # ── Главный метод ─────────────────────────────────────────────────────────
-
-    async def execute(
-        self,
-        actions: list[SyncAction],
-        report: Optional[SyncReport] = None,
-    ) -> SyncReport:
+    async def execute(self, actions: list[SyncAction], report: Optional[SyncReport] = None) -> SyncReport:
         if report is None:
             report = SyncReport()
-
         self._report_lock = asyncio.Lock()
 
-        # Проверка места на диске
-        bytes_needed = sum(
-            a.size_bytes for a in actions
-            if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE)
-        )
+        bytes_needed = sum(a.size_bytes for a in actions if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE))
         ok, free = self._check_disk_space(bytes_needed)
         if not ok and free != -1:
-            msg = (f"Недостаточно места: нужно {bytes_needed // (1024**2)} МБ, "
-                   f"свободно {free // (1024**2)} МБ")
+            msg = f"Недостаточно места: нужно {bytes_needed//(1024**2)} МБ, свободно {free//(1024**2)} МБ"
             report.errors.append(msg)
             report.add_log(f"[ОШИБКА] {msg}")
             report.finished_at = datetime.now()
             return report
 
-        # Фильтруем активные действия
-        active = [a for a in actions
-                  if a.action not in (ActionType.SKIP_EQUAL, ActionType.SKIP_PROTECTED)]
-
+        active = [a for a in actions if a.action not in (ActionType.SKIP_EQUAL, ActionType.SKIP_PROTECTED)]
         if not active:
             report.finished_at = datetime.now()
             return report
 
-        # Разделяем на маленькие и большие для разной стратегии
-        small_copy: list[SyncAction] = []   # COPY_NEW/UPDATE < 4 MB
-        large_copy: list[SyncAction] = []   # COPY_NEW/UPDATE >= 4 MB
-        other: list[SyncAction] = []        # DELETE, DELETE_PERM
+        small_copy = [a for a in active if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE) and a.size_bytes < SMALL_FILE_THRESHOLD]
+        large_copy = [a for a in active if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE) and a.size_bytes >= SMALL_FILE_THRESHOLD]
+        other      = [a for a in active if a.action not in (ActionType.COPY_NEW, ActionType.COPY_UPDATE)]
 
-        for a in active:
-            if a.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE):
-                if a.size_bytes < SMALL_FILE_THRESHOLD:
-                    small_copy.append(a)
-                else:
-                    large_copy.append(a)
-            else:
-                other.append(a)
-
-        # 1. Маленькие файлы — батчами (эффективнее)
         await self._execute_small_batch(small_copy, report)
 
-        # 2. Большие файлы — по одному с прогрессом по байтам
         sem = asyncio.Semaphore(self.profile.max_workers)
-        large_tasks = [self._execute_large(a, report, sem) for a in large_copy]
-        if large_tasks:
-            await asyncio.gather(*large_tasks, return_exceptions=True)
-
-        # 3. DELETE и DELETE_PERM — по одному
-        other_tasks = [self._execute_other(a, report) for a in other]
-        if other_tasks:
-            await asyncio.gather(*other_tasks, return_exceptions=True)
+        for action in large_copy:
+            if self.stop_flag(): break
+            await self._execute_large(action, report, sem)
+        for action in other:
+            if self.stop_flag(): break
+            await self._execute_other(action, report)
 
         report.finished_at = datetime.now()
         return report
 
-    # ── Батч маленьких файлов ─────────────────────────────────────────────────
-
-    async def _execute_small_batch(
-        self,
-        actions: list[SyncAction],
-        report: SyncReport,
-    ) -> None:
+    async def _execute_small_batch(self, actions: list[SyncAction], report: SyncReport) -> None:
         if not actions:
             return
-
         if self.dry_run:
             for a in actions:
-                self._emit(a, f"[DRY] {'КОПИРОВАТЬ' if a.action == ActionType.COPY_NEW else 'ОБНОВИТЬ'}  {a.rel_path}")
-                report.add_log(f"  + {a.rel_path}")
+                verb = "КОПИРОВАТЬ" if a.action == ActionType.COPY_NEW else "ОБНОВИТЬ"
+                self._emit(a, f"[DRY] {verb}  {a.rel_path}")
+                report.add_log(
+                    f"  [DRY] {verb:<10} {str(a.rel_path):<55} {_fmt(a.size_bytes):>7}"
+                    f"  [{a.rel_path.suffix.lower() or 'нет расш.'}]"
+                )
             async with self._report_lock:
                 report.actions_done.extend(actions)
                 report.bytes_copied += sum(a.size_bytes for a in actions)
             return
 
-        # Группируем по типу: сначала UPDATE делаем backup
         for a in actions:
             if a.action == ActionType.COPY_UPDATE:
-                dst_path = self.dst / a.rel_path
-                await self._backup_file(dst_path, a.rel_path)
+                await self._backup_file(self.dst / a.rel_path, a.rel_path)
 
-        # Батчами по BATCH_SIZE
         for i in range(0, len(actions), BATCH_SIZE):
+            if self.stop_flag(): break
             batch = actions[i:i + BATCH_SIZE]
-
-            # Уведомляем о первом файле в батче
-            first = batch[0]
-            self._emit(first, f"Копирование {len(batch)} файлов... {first.rel_path.name}")
-
+            self._emit(batch[0], f"Копирование {len(batch)} файлов... {batch[0].rel_path.name}")
             pairs = [(self.src / a.rel_path, self.dst / a.rel_path) for a in batch]
             results = await copy_batch_small(pairs)
-
             async with self._report_lock:
-                for a, (src_p, dst_p, ok) in zip(batch, results):
+                for a, (_, _, ok) in zip(batch, results):
+                    verb = "КОПИРОВАТЬ" if a.action == ActionType.COPY_NEW else "ОБНОВИТЬ"
                     if ok:
                         report.actions_done.append(a)
                         report.bytes_copied += a.size_bytes
-                        report.add_log(f"  + {a.rel_path}")
+                        report.add_log(
+                            f"  ✓ {verb:<10} {str(a.rel_path):<55} {_fmt(a.size_bytes):>7}"
+                            f"  [{a.rel_path.suffix.lower() or 'нет расш.'}]"
+                        )
                     else:
                         report.errors.append(f"Ошибка копирования: {a.rel_path}")
-                        report.add_log(f"  [ОШИБКА] {a.rel_path}")
+                        report.add_log(
+                            f"  ✗ {verb:<10} {str(a.rel_path):<55} — ОШИБКА"
+                        )
 
-    # ── Большие файлы с прогрессом ────────────────────────────────────────────
-
-    async def _execute_large(
-        self,
-        action: SyncAction,
-        report: SyncReport,
-        sem: asyncio.Semaphore,
-    ) -> None:
+    async def _execute_large(self, action: SyncAction, report: SyncReport, sem: asyncio.Semaphore) -> None:
         async with sem:
             rel = action.rel_path
             size = action.size_bytes
             prefix = "[DRY] " if self.dry_run else ""
             verb = "КОПИРОВАТЬ" if action.action == ActionType.COPY_NEW else "ОБНОВИТЬ"
-            self._emit(action, f"{prefix}{verb}  {rel}  ({_fmt_size(size)})")
-            report.add_log(f"  + {prefix}{rel}  ({_fmt_size(size)})")
-
+            self._emit(action, f"{prefix}{verb}  {rel}  ({_fmt(size)})")
+            report.add_log(
+                f"  → {prefix}{verb:<10} {str(rel):<55} {_fmt(size):>7}"
+                f"  [{rel.suffix.lower() or 'нет расш.'}]  (большой файл)"
+            )
             if self.dry_run:
                 async with self._report_lock:
                     report.actions_done.append(action)
                     report.bytes_copied += size
                 return
-
             if action.action == ActionType.COPY_UPDATE:
                 await self._backup_file(self.dst / rel, rel)
-
-            # Прогресс по байтам — обновляем UI каждые 5 MB
-            _last_reported = [0]
-
+            _last = [0]
             def _prog(done: int, total: int) -> None:
-                if done - _last_reported[0] >= 5 * 1024 * 1024:
-                    _last_reported[0] = done
+                if done - _last[0] >= 5 * 1024 * 1024:
+                    _last[0] = done
                     pct = int(done / total * 100) if total else 0
-                    self._emit(
-                        action,
-                        f"{verb}  {rel.name}  {_fmt_size(done)}/{_fmt_size(total)}  {pct}%"
-                    )
-
-            ok = await copy_file(
-                self.src / rel,
-                self.dst / rel,
-                verify=self.profile.use_hash,   # верифицируем если включён хеш-режим
-                progress_cb=_prog,
-            )
-
+                    self._emit(action, f"{verb}  {rel.name}  {_fmt(done)}/{_fmt(total)}  {pct}%")
+            ok = await copy_file(self.src / rel, self.dst / rel, verify=self.profile.use_hash, progress_cb=_prog)
             async with self._report_lock:
                 if ok:
                     report.actions_done.append(action)
                     report.bytes_copied += size
+                    report.add_log(
+                        f"  ✓ {verb:<10} {str(rel):<55} {_fmt(size):>7}  верифицирован"
+                    )
                 else:
                     report.errors.append(f"Ошибка копирования: {rel}")
-                    report.add_log(f"  [ОШИБКА] {rel}")
+                    report.add_log(
+                        f"  ✗ {verb:<10} {str(rel):<55} — ОШИБКА КОПИРОВАНИЯ"
+                    )
 
-    # ── DELETE и DELETE_PERM ──────────────────────────────────────────────────
-
-    async def _execute_other(
-        self,
-        action: SyncAction,
-        report: SyncReport,
-    ) -> None:
+    async def _execute_other(self, action: SyncAction, report: SyncReport) -> None:
         rel = action.rel_path
         prefix = "[DRY] " if self.dry_run else ""
-
         try:
             if action.action == ActionType.DELETE:
                 self._emit(action, f"{prefix}В BACKUP  {rel}")
-                report.add_log(f"  - {prefix}{rel}")
-
+                report.add_log(
+                    f"  ⊘ {'[DRY] ' if self.dry_run else ''}В BACKUP  "
+                    f"{str(rel):<55} {_fmt(action.size_bytes):>7}"
+                    f"  [{rel.suffix.lower() or 'нет расш.'}]"
+                )
                 if not self.dry_run:
                     backed = await self._backup_file(self.dst / rel, rel)
                     async with self._report_lock:
@@ -260,9 +189,7 @@ class SyncEngine:
                             report.actions_done.append(action)
                             report.bytes_backed_up += action.size_bytes
                             try:
-                                await asyncio.to_thread(
-                                    (self.dst / rel).unlink, missing_ok=True
-                                )
+                                await asyncio.to_thread((self.dst / rel).unlink, missing_ok=True)
                             except OSError as e:
                                 report.warnings.append(f"Удалить после backup {rel}: {e}")
                         else:
@@ -271,20 +198,18 @@ class SyncEngine:
                     async with self._report_lock:
                         report.actions_done.append(action)
                         report.bytes_backed_up += action.size_bytes
-
             elif action.action == ActionType.DELETE_PERM:
-                # Безопаснее чем прямой unlink — используем системную корзину если доступна
                 self._emit(action, f"{prefix}УДАЛЕНИЕ  {rel}")
-                report.add_log(f"  🗑 {prefix}{rel}")
-
+                report.add_log(
+                    f"  🗑 {'[DRY] ' if self.dry_run else ''}УДАЛИТЬ   "
+                    f"{str(rel):<55} {_fmt(action.size_bytes):>7}"
+                )
                 if not self.dry_run:
                     dst_path = self.dst / rel
                     try:
                         if USE_TRASH:
-                            # В корзину — можно восстановить
                             await asyncio.to_thread(send2trash, str(dst_path))
                         else:
-                            # Безвозвратно — только если send2trash недоступен
                             await asyncio.to_thread(dst_path.unlink, missing_ok=True)
                         async with self._report_lock:
                             report.actions_done.append(action)
@@ -296,7 +221,6 @@ class SyncEngine:
                     async with self._report_lock:
                         report.actions_done.append(action)
                         report.bytes_deleted_perm += action.size_bytes
-
         except Exception as e:
             async with self._report_lock:
                 report.errors.append(f"{rel}: {e}")
@@ -305,8 +229,7 @@ class SyncEngine:
         if self.progress_cb:
             self.progress_cb(action, msg)
 
-
-def _fmt_size(size: int) -> str:
+def _fmt(size: int) -> str:
     for unit in ("B", "K", "M", "G"):
         if size < 1024:
             return f"{size:.0f}{unit}"

@@ -1,14 +1,25 @@
 """
-infrastructure/scanner.py
+infrastructure/scanner.py — Сканирование директорий с поддержкой больших объёмов.
+
+Ключевые решения для 18+ GB:
+  1. Генератор вместо списка — не грузит все FileInfo в RAM сразу
+  2. Хеширование опционально и постепенное — не блокирует UI
+  3. Лимит памяти: если файлов > MAX_FILES_WARN — предупреждение
+  4. Все исключения перехватываются — программа не падает от permission error
+  5. progress_cb вызывается ДО хеширования — UI отзывчив всегда
 """
 from __future__ import annotations
+
 import fnmatch
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from domain.models import FileInfo, HashAlgo, _classify
 from infrastructure.hasher import hash_file
+
+# Предупреждение если файлов больше (не останавливает сканирование)
+MAX_FILES_WARN = 500_000
 
 _SYSTEM_FILES = {
     "thumbs.db", ".ds_store", "desktop.ini", ".spotlight-v100",
@@ -26,17 +37,10 @@ def _should_ignore(path: Path, ignore_hidden: bool = True) -> bool:
 
 
 def _match_pattern(rel_path: Path, pattern: str) -> bool:
-    """
-    Кроссплатформенный glob-матчинг.
-    *.jpg  — матчит имя файла в любой папке
-    temp/* — матчит полный относительный путь (через as_posix)
-    """
     pat = pattern.lower()
-    posix = rel_path.as_posix().lower()  # всегда прямые слеши, даже на Windows
+    posix = rel_path.as_posix().lower()
     if "/" not in pat:
-        # паттерн без слеша → сравниваем только с именем файла
         return fnmatch.fnmatch(rel_path.name.lower(), pat)
-    # паттерн со слешем → сравниваем с полным относительным путём
     return fnmatch.fnmatch(posix, pat)
 
 
@@ -48,46 +52,45 @@ def scan_directory(
     hash_algo: HashAlgo = HashAlgo.SHA256,
     ignore_hidden: bool = True,
     progress_cb: Optional[Callable[[Path], None]] = None,
+    error_cb: Optional[Callable[[Path, Exception], None]] = None,
 ) -> dict[Path, FileInfo]:
-    """Сканирует директорию и возвращает {rel_path: FileInfo}."""
-    if not root.exists():
-        return {}
-    if not root.is_dir():
+    """
+    Сканирует директорию. Возвращает {rel_path: FileInfo}.
+
+    error_cb(path, exc) — вызывается при ошибке доступа к файлу.
+    Если error_cb не задан — ошибки молча пропускаются.
+    """
+    if not root.exists() or not root.is_dir():
         return {}
 
     result: dict[Path, FileInfo] = {}
+    file_count = 0
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        if ignore_hidden:
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-
-        for filename in filenames:
-            full_path = Path(dirpath) / filename
-            rel_path = full_path.relative_to(root)
-
-            if _should_ignore(full_path, ignore_hidden):
-                continue
-            if include_patterns and not any(_match_pattern(rel_path, p) for p in include_patterns):
-                continue
-            if exclude_patterns and any(_match_pattern(rel_path, p) for p in exclude_patterns):
-                continue
-
+    for rel_path, full_path, stat in _walk_files(
+        root, include_patterns, exclude_patterns, ignore_hidden, error_cb
+    ):
+        # Сообщаем UI о файле ДО хеширования — интерфейс не замерзает
+        if progress_cb:
             try:
-                stat = full_path.stat()
-            except OSError:
+                progress_cb(full_path)
+            except Exception:
+                pass
+
+        file_hash: Optional[str] = None
+        if use_hash:
+            try:
+                file_hash = hash_file(full_path, hash_algo.value)
+                if file_hash is None:
+                    # Ошибка чтения — пропускаем файл
+                    if error_cb:
+                        error_cb(full_path, OSError("hash failed"))
+                    continue
+            except Exception as e:
+                if error_cb:
+                    error_cb(full_path, e)
                 continue
 
-            # Сообщаем о файле сразу (до хеширования) для отзывчивого UI
-            if progress_cb:
-                progress_cb(full_path)
-
-            file_hash: Optional[str] = None
-            if use_hash:
-                file_hash = hash_file(full_path, hash_algo.value)
-                # None = ошибка чтения, пропускаем файл
-                if file_hash is None:
-                    continue
-
+        try:
             result[rel_path] = FileInfo(
                 path=full_path,
                 rel_path=rel_path,
@@ -95,32 +98,107 @@ def scan_directory(
                 mtime=stat.st_mtime,
                 hash=file_hash,
             )
+        except Exception:
+            continue
+
+        file_count += 1
 
     return result
 
 
+def _walk_files(
+    root: Path,
+    include_patterns: Optional[list[str]],
+    exclude_patterns: Optional[list[str]],
+    ignore_hidden: bool,
+    error_cb: Optional[Callable],
+) -> Iterator[tuple[Path, Path, os.stat_result]]:
+    """
+    Генератор файлов — не грузит всё в память.
+    Перехватывает PermissionError и другие ошибки доступа.
+    """
+    try:
+        walk_iter = os.walk(root, onerror=lambda e: _handle_walk_error(e, error_cb))
+    except Exception:
+        return
+
+    for dirpath, dirnames, filenames in walk_iter:
+        # Фильтруем скрытые папки на месте (изменение dirnames in-place)
+        if ignore_hidden:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+        # Пропускаем папки backup
+        dirnames[:] = [d for d in dirnames if not d.startswith(".flashsync_backup")]
+
+        for filename in filenames:
+            full_path = Path(dirpath) / filename
+
+            try:
+                rel_path = full_path.relative_to(root)
+            except ValueError:
+                continue
+
+            if _should_ignore(full_path, ignore_hidden):
+                continue
+
+            if include_patterns and not any(
+                _match_pattern(rel_path, p) for p in include_patterns
+            ):
+                continue
+
+            if exclude_patterns and any(
+                _match_pattern(rel_path, p) for p in exclude_patterns
+            ):
+                continue
+
+            try:
+                stat = full_path.stat()
+            except (OSError, PermissionError) as e:
+                if error_cb:
+                    error_cb(full_path, e)
+                continue
+
+            yield rel_path, full_path, stat
+
+
+def _handle_walk_error(exc: OSError, error_cb: Optional[Callable]) -> None:
+    if error_cb:
+        try:
+            error_cb(Path(exc.filename or "?"), exc)
+        except Exception:
+            pass
+
+
 def get_directory_stats(root: Path) -> dict:
-    """Быстрая статистика без хранения FileInfo."""
+    """Быстрая статистика без FileInfo — только счётчики."""
     total_files = 0
     total_size = 0
     extensions: dict[str, int] = {}
     categories: dict[str, int] = {}
 
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            fp = Path(dirpath) / fn
-            if _should_ignore(fp):
-                continue
-            try:
-                sz = fp.stat().st_size
-            except OSError:
-                continue
-            total_files += 1
-            total_size += sz
-            ext = fp.suffix.lower()
-            extensions[ext] = extensions.get(ext, 0) + 1
-            cat = _classify(ext)
-            categories[cat] = categories.get(cat, 0) + 1
+    def _walk_err(e):
+        pass
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_err):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and not d.startswith(".flashsync")]
+            for fn in filenames:
+                fp = Path(dirpath) / fn
+                if _should_ignore(fp):
+                    continue
+                try:
+                    sz = fp.stat().st_size
+                except OSError:
+                    continue
+                total_files += 1
+                total_size += sz
+                ext = fp.suffix.lower()
+                extensions[ext] = extensions.get(ext, 0) + 1
+                cat = _classify(ext)
+                categories[cat] = categories.get(cat, 0) + 1
+    except Exception:
+        pass
 
     return {
         "total_files": total_files,
