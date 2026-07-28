@@ -1,66 +1,66 @@
+#!/usr/bin/env python3
 """
-scripts/build_exe.py — Сборка standalone .exe через PyInstaller.
+scripts/build_exe.py — Сборка FlashSync Pro в standalone .exe через PyInstaller.
 
-Запуск (Windows PowerShell):
-  pip install pyinstaller
-  python scripts/build_exe.py
+Использование:
+    pip install pyinstaller
+    python scripts/build_exe.py
 
-Результат: dist/flashsync.exe  (или dist/flashsync на Linux/macOS)
+Результат: dist/FlashSync.exe (Windows) или dist/FlashSync (Linux/macOS)
 """
 from __future__ import annotations
-
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).parent.parent
-DIST = ROOT / "dist"
-BUILD = ROOT / "build"
-SPEC  = ROOT / "flashsync.spec"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-PYINSTALLER_ARGS = [
-    sys.executable, "-m", "PyInstaller",
-    "--onefile",
-    "--name", "flashsync",
-    "--console",
-    # Дополнительные данные
-    "--add-data", f"{ROOT / 'domain'}{os.pathsep}domain",
-    "--add-data", f"{ROOT / 'application'}{os.pathsep}application",
-    "--add-data", f"{ROOT / 'infrastructure'}{os.pathsep}infrastructure",
-    "--add-data", f"{ROOT / 'ui'}{os.pathsep}ui",
-    # Скрытые импорты Textual
-    "--hidden-import", "textual",
-    "--hidden-import", "textual.app",
-    "--hidden-import", "textual.widgets",
-    "--hidden-import", "aiofiles",
-    # Точка входа
-    str(ROOT / "main.py"),
-]
+def main() -> int:
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        print("PyInstaller не установлен. Установите: pip install pyinstaller", file=sys.stderr)
+        return 1
 
+    main_py = PROJECT_ROOT / "main.py"
+    if not main_py.exists():
+        print(f"Не найден {main_py}", file=sys.stderr)
+        return 1
 
-def build():
-    print("⚙️  Запуск PyInstaller...")
-    print(f"   Корень проекта: {ROOT}")
-    result = subprocess.run(PYINSTALLER_ARGS, cwd=ROOT)
+    # Чистим предыдущие сборки
+    for d in ("build", "dist"):
+        p = PROJECT_ROOT / d
+        if p.exists():
+            shutil.rmtree(p)
+
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--name=FlashSync",
+        "--onefile",
+        "--console",
+        "--clean",
+        "--noconfirm",
+        # Textual использует динамические импорты CSS/виджетов — добавляем явно
+        "--hidden-import=textual",
+        "--hidden-import=textual.widgets",
+        "--hidden-import=rich",
+        str(main_py),
+    ]
+
+    print("Запуск PyInstaller:")
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+
     if result.returncode == 0:
-        exe_name = "flashsync.exe" if os.name == "nt" else "flashsync"
-        exe_path = DIST / exe_name
-        size_mb = exe_path.stat().st_size / (1024 * 1024) if exe_path.exists() else 0
-        print(f"\n✅ Сборка завершена!")
-        print(f"   Файл: {exe_path}")
-        print(f"   Размер: {size_mb:.1f} МБ")
-        print(f"\nЗапуск:")
-        print(f"   {exe_path}               → TUI")
-        print(f"   {exe_path} --cli         → CLI меню")
-        print(f"   {exe_path} scan -s X -d Y → Сканирование")
-        print(f"   {exe_path} sync -s X -d Y → Синхронизация")
-        print(f"   {exe_path} audit -s X -d Y → Аудит")
+        dist_dir = PROJECT_ROOT / "dist"
+        print(f"\nГотово! Исполняемый файл в: {dist_dir}")
     else:
-        print("❌ Ошибка сборки. Убедитесь что установлен PyInstaller:")
-        print("   pip install pyinstaller")
+        print("\nСборка завершилась с ошибкой.", file=sys.stderr)
+
+    return result.returncode
 
 
 if __name__ == "__main__":
-    build()
+    sys.exit(main())

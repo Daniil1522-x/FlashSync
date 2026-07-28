@@ -1,69 +1,47 @@
 """
-ui/tui/file_manager.py — Управление файлами плана с древовидной структурой папок.
+ui/tui/file_manager.py — Экран ручного управления планом синхронизации.
 
-Левая панель  — дерево папок (можно выбрать всю папку сразу)
-Правая панель — файлы выбранной папки с кнопками действий
+Структура: дерево папок слева (с количеством файлов), список файлов
+выбранной папки справа. Множественный выбор (Space / A = вся папка).
+Кнопки применяют действие к выбранным файлам.
+
+Кнопка "🗑 УДАЛИТЬ" (DELETE_PERM) убрана из UI — слишком опасно для
+синхронизатора флешка↔ПК (см. обсуждение). ActionType.DELETE_PERM и
+обработка в sync_engine.py остаются в коде на случай будущего использования,
+но пользователю явно эта возможность не предлагается.
 """
 from __future__ import annotations
-import dataclasses
 from collections import defaultdict
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Optional
+import dataclasses
 
 from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import (
-    Label, Button, DataTable, Select, Static, Tree, Footer,
-)
+from textual.widgets import Label, Button, DataTable, Tree
 from textual import on
 from rich.text import Text
 
-from domain.models import SyncAction, ActionType, ProtectionLevel, ProtectionRule, SyncProfile
+from domain.models import SyncAction, ActionType, ProtectionLevel, SyncProfile, ProtectionRule
+from infrastructure.storage import load_profiles, save_profiles
 
-
-# ── Стили ─────────────────────────────────────────────────────────────────────
-
+ACTION_LABEL = {
+    ActionType.COPY_NEW:       "НОВЫЙ",
+    ActionType.COPY_UPDATE:    "ИЗМЕНЁН",
+    ActionType.DELETE:         "В BACKUP",
+    ActionType.DELETE_PERM:    "УДАЛИТЬ",
+    ActionType.SKIP_EQUAL:     "одинаковый",
+    ActionType.SKIP_PROTECTED: "ЗАЩИЩЁН",
+}
 ACTION_STYLE = {
     ActionType.COPY_NEW:       "ansi_bright_green",
     ActionType.COPY_UPDATE:    "ansi_yellow",
     ActionType.DELETE:         "ansi_red",
+    ActionType.DELETE_PERM:    "ansi_red",
     ActionType.SKIP_EQUAL:     "ansi_bright_black",
     ActionType.SKIP_PROTECTED: "ansi_cyan",
 }
-ACTION_SHORT = {
-    ActionType.COPY_NEW:       "НОВЫЙ",
-    ActionType.COPY_UPDATE:    "ИЗМЕНЁН",
-    ActionType.DELETE:         "ТОЛЬКО_DST",
-    ActionType.SKIP_EQUAL:     "одинак.",
-    ActionType.SKIP_PROTECTED: "ЗАЩИЩЁН",
-}
-ACTION_DESC = {
-    ActionType.COPY_NEW:       "скопировать в dst",
-    ActionType.COPY_UPDATE:    "обновить → backup старый",
-    ActionType.DELETE:         "переместить в backup",
-    ActionType.SKIP_EQUAL:     "пропустить (одинаковые)",
-    ActionType.SKIP_PROTECTED: "пропустить (защищён)",
-}
-
-FILTER_OPTIONS = [
-    ("Все файлы",            "all"),
-    ("Только новые",         "copy_new"),
-    ("Только изменённые",    "copy_update"),
-    ("Только backup",        "delete"),
-    ("Только защищённые",    "skip_protected"),
-    ("Одинаковые",           "skip_equal"),
-]
-
-
-def _real_size(action: SyncAction) -> int:
-    """Размер файла независимо от типа действия."""
-    if action.src_file:
-        return action.src_file.size
-    if action.dst_file:
-        return action.dst_file.size
-    return 0
 
 
 def _fmt_size(size: int) -> str:
@@ -74,456 +52,262 @@ def _fmt_size(size: int) -> str:
     return f"{size:.1f}T"
 
 
-def _change_action(action: SyncAction, new_type: ActionType) -> SyncAction:
-    new_protection = (
-        ProtectionLevel.SINGLE
-        if new_type == ActionType.SKIP_PROTECTED
-        else ProtectionLevel.NONE
-    )
-    return dataclasses.replace(
-        action,
-        action=new_type,
-        protection_level=new_protection,
-        confirmed=0,
-        reason=f"изменено вручную",
-    )
-
-
-def _build_folder_tree(plan: list[SyncAction]) -> dict:
-    """
-    Строит словарь { папка_posix: [индексы_в_plan] }
-    Корневые файлы идут под ключом "".
-    """
-    folders: dict[str, list[int]] = defaultdict(list)
-    for i, a in enumerate(plan):
-        parent = a.rel_path.parent.as_posix()
-        if parent == ".":
-            parent = ""
-        folders[parent].append(i)
-    return dict(folders)
-
-
-# ── Диалог выбора действия для одного файла ───────────────────────────────────
-
-class SingleFileActionScreen(ModalScreen):
-    CSS = """
-    SingleFileActionScreen { align: center middle; }
-    #sfa {
-        width: 62; height: auto;
-        border: thick $primary; background: $surface; padding: 1 2;
-    }
-    #sfa Button { width: 100%; margin-bottom: 1; }
-    #sfa #file-info { color: $text-muted; margin-bottom: 1; }
-    """
-
-    def __init__(self, action: SyncAction):
-        super().__init__()
-        self._action = action
-
-    def compose(self) -> ComposeResult:
-        name = str(self._action.rel_path)
-        size = _fmt_size(_real_size(self._action))
-        current = ACTION_SHORT.get(self._action.action, "?")
-        with Container(id="sfa"):
-            yield Label(f"[bold]{name}[/]", id="file-info")
-            yield Label(f"Размер: {size}  |  Сейчас: [{ACTION_STYLE.get(self._action.action,'')}]{current}[/]\n\nВыберите действие:")
-            yield Button("КОПИРОВАТЬ — скопировать в dst",              id="a-copy",    variant="success")
-            yield Button("ОБНОВИТЬ — обновить (старая версия → backup)", id="a-update",  variant="warning")
-            yield Button("ПРОПУСТИТЬ — ничего не делать",               id="a-skip",    variant="default")
-            yield Button("ЗАЩИТИТЬ — никогда не трогать этот файл",     id="a-protect", variant="primary")
-            yield Button("В BACKUP — переместить в backup",             id="a-backup",  variant="error")
-            yield Button("Отмена",                                       id="a-cancel",  variant="default")
-
-    @on(Button.Pressed, "#a-copy")
-    def _copy(self):    self.dismiss(ActionType.COPY_NEW)
-    @on(Button.Pressed, "#a-update")
-    def _update(self):  self.dismiss(ActionType.COPY_UPDATE)
-    @on(Button.Pressed, "#a-skip")
-    def _skip(self):    self.dismiss(ActionType.SKIP_EQUAL)
-    @on(Button.Pressed, "#a-protect")
-    def _protect(self): self.dismiss(ActionType.SKIP_PROTECTED)
-    @on(Button.Pressed, "#a-backup")
-    def _backup(self):  self.dismiss(ActionType.DELETE)
-    @on(Button.Pressed, "#a-cancel")
-    def _cancel(self):  self.dismiss(None)
-
-
-# ── Главный экран управления файлами ──────────────────────────────────────────
-
 class FileManagerScreen(ModalScreen):
     """
-    Левая панель: дерево папок
-    Правая панель: файлы выбранной папки
-    Низ: кнопки действий
+    Возвращает изменённый план (list[SyncAction]) через dismiss(),
+    либо None если пользователь отменил.
     """
 
     CSS = """
     FileManagerScreen { align: center middle; }
-
     #fm-root {
-        width: 98%; height: 94%;
-        border: thick $primary;
-        background: $surface;
-        layout: vertical;
-        padding: 0;
+        width: 94%; height: 92%;
+        border: thick $primary; background: $surface;
+        padding: 0; layout: vertical;
     }
-
-    /* ── Строка заголовка ── */
-    #fm-topbar {
-        height: 3; layout: horizontal;
-        background: $surface-darken-2; padding: 0 1;
-        align: left middle;
-    }
-    #fm-topbar Label { margin: 0 1; }
-    #fm-topbar Select { width: 22; margin: 0 1; }
-    #fm-topbar Button { margin: 0 1; }
-
-    /* ── Подсказка ── */
-    #fm-hint {
-        height: 1; background: $surface-darken-1;
-        color: $text-muted; padding: 0 1;
-    }
-
-    /* ── Основной layout: дерево + таблица ── */
+    #fm-header { height: 2; background: $primary; color: $background; padding: 0 1; align: left middle; }
     #fm-body { height: 1fr; layout: horizontal; }
-
-    /* Дерево папок */
-    #fm-tree-panel {
-        width: 30%; min-width: 22;
-        border-right: solid $primary;
-        background: $surface-darken-1;
-        layout: vertical;
-    }
-    #fm-tree-title {
-        height: 1; background: $primary;
-        color: $background; text-align: center;
-    }
-    #fm-folder-tree { height: 1fr; }
-
-    /* Таблица файлов */
-    #fm-file-panel { width: 1fr; layout: vertical; }
-    #fm-file-title {
-        height: 1; background: $accent;
-        color: $background; padding: 0 1;
-    }
-    #fm-table { height: 1fr; }
-
-    /* ── Панель действий ── */
+    #fm-tree-panel { width: 30%; border-right: solid $accent; }
+    #fm-tree-panel Tree { height: 1fr; }
+    #fm-table-panel { width: 1fr; }
+    #fm-table-panel DataTable { height: 1fr; }
+    #fm-selected-label { height: 1; padding: 0 1; color: $text-muted; }
     #fm-actions {
         height: 3; layout: horizontal;
-        background: $surface-darken-2; padding: 0 1;
-        align: left middle;
+        background: $surface-darken-2; padding: 0 1; align: left middle;
     }
-    #fm-actions Label { color: $text-muted; margin: 0 1; }
-    #fm-actions Button { margin: 0 1; }
-
-    /* ── Нижние кнопки ── */
+    #fm-actions Button { margin-right: 1; }
     #fm-footer {
         height: 3; layout: horizontal;
-        background: $surface-darken-2; padding: 0 1;
-        align: left middle;
+        background: $surface-darken-1; padding: 0 1; align: left middle;
     }
-    #fm-footer Button { margin: 0 1; }
-    #fm-footer #sel-info { width: 1fr; color: $text-muted; }
+    #fm-footer Button { margin-right: 1; }
+    #fm-footer Label { width: 1fr; color: $text-muted; }
     """
 
     BINDINGS = [
-        Binding("space",  "toggle_select", "Выбрать",    show=True),
-        Binding("a",      "select_all",    "Все в папке",show=True),
-        Binding("escape", "do_cancel",     "Отмена",     show=True),
+        ("space", "toggle_select", "Выбрать"),
+        ("a", "select_all_folder", "Вся папка"),
     ]
 
     def __init__(self, plan: list[SyncAction], profile: SyncProfile):
         super().__init__()
+        self._original_plan = plan
         self._plan: list[SyncAction] = list(plan)
         self._profile = profile
-        self._filter: str = "all"
-        self._current_folder: str = ""       # текущая открытая папка
-        self._row_to_plan: list[int] = []    # строка таблицы → индекс плана
-        self._selected: set[int] = set()     # выбранные индексы плана
-        self._folder_tree: dict[str, list[int]] = {}
+        self._selected_paths: set[str] = set()
+        self._current_folder: Optional[str] = None
+        self._folder_actions: dict[str, list[SyncAction]] = defaultdict(list)
+        self._build_folder_index()
+
+    # ── Индексация по папкам ────────────────────────────────────────────────
+
+    def _build_folder_index(self) -> None:
+        self._folder_actions.clear()
+        for a in self._plan:
+            if a.action == ActionType.SKIP_EQUAL:
+                continue
+            rel = a.rel_path
+            folder = str(rel.parent) if rel.parent != Path(".") else "(корень)"
+            self._folder_actions[folder].append(a)
 
     def compose(self) -> ComposeResult:
         with Container(id="fm-root"):
-            # Топбар
-            with Horizontal(id="fm-topbar"):
-                yield Label("[bold]Управление файлами[/]")
-                yield Label("Фильтр:")
-                yield Select(
-                    [(label, val) for label, val in FILTER_OPTIONS],
-                    value="all", id="fm-filter", allow_blank=False,
-                )
-                yield Button("Выбрать все в папке", id="btn-sel-all", variant="default")
-                yield Button("Снять всё",           id="btn-sel-none", variant="default")
-
-            # Подсказка
-            yield Label(
-                "  Пробел=выбрать строку  |  A=все в папке  |  "
-                "Enter/двойной_клик=изменить одну  |  Папка в дереве=показать содержимое",
-                id="fm-hint"
-            )
-
-            # Основное тело
+            yield Label(" Управление файлами синхронизации ", id="fm-header")
             with Horizontal(id="fm-body"):
-                # Дерево папок (левая панель)
                 with Vertical(id="fm-tree-panel"):
-                    yield Label(" Папки ", id="fm-tree-title")
-                    yield Tree("[корень]", id="fm-folder-tree")
-
-                # Файлы (правая панель)
-                with Vertical(id="fm-file-panel"):
-                    yield Label(" Файлы папки: [корень] ", id="fm-file-title")
+                    yield Tree("Папки", id="fm-tree")
+                with Vertical(id="fm-table-panel"):
                     yield DataTable(id="fm-table", cursor_type="row")
-
-            # Панель действий к выбранным
+                    yield Label("Выбрано: 0", id="fm-selected-label")
             with Horizontal(id="fm-actions"):
-                yield Label("К выбранным:")
-                yield Button("КОПИРОВАТЬ",   id="act-copy",    variant="success")
-                yield Button("ПРОПУСТИТЬ",   id="act-skip",    variant="default")
-                yield Button("ЗАЩИТИТЬ",     id="act-protect", variant="primary")
-                yield Button("В BACKUP",     id="act-backup",  variant="warning")
-
-            # Нижние кнопки
+                yield Button("Копировать",      id="act-copy",     variant="success")
+                yield Button("Пропустить",       id="act-skip",     variant="default")
+                yield Button("Защитить",         id="act-protect",  variant="primary")
+                yield Button("В BACKUP",         id="act-backup",   variant="warning")
+                yield Button("Сохранить защиту в профиль", id="act-save-rules", variant="default")
             with Horizontal(id="fm-footer"):
-                yield Button("Применить",              id="btn-apply",      variant="success")
-                yield Button("Сохранить защиту навсегда", id="btn-save",    variant="primary")
-                yield Button("Отмена",                 id="btn-cancel",     variant="default")
-                yield Label("", id="sel-info")
+                yield Button("Применить", id="btn-apply",  variant="success")
+                yield Button("Отмена",    id="btn-cancel", variant="default")
+                yield Label("", id="fm-footer-status")
 
     def on_mount(self) -> None:
         t = self.query_one("#fm-table", DataTable)
-        t.add_columns(" ", "Статус", "Что будет", "Файл", "Размер", "Кат.")
-        self._rebuild_folder_tree()
-        self._show_folder("")
+        t.add_columns(" ", "Действие", "Файл", "Размер")
+        self._fill_tree()
 
-    # ── Построение дерева папок ───────────────────────────────────────────────
+    # ── Дерево папок ─────────────────────────────────────────────────────────
 
-    def _rebuild_folder_tree(self) -> None:
-        self._folder_tree = _build_folder_tree(self._plan)
-
-        tree = self.query_one("#fm-folder-tree", Tree)
+    def _fill_tree(self) -> None:
+        tree = self.query_one("#fm-tree", Tree)
         tree.clear()
-        tree.root.label = "[корень]"
-        tree.root.data = ""
-
-        # Собираем все уникальные папки
-        all_folders = set(self._folder_tree.keys())
-        # Добавляем промежуточные папки которых нет в дереве
-        extra = set()
-        for f in all_folders:
-            parts = f.split("/") if f else []
-            for i in range(len(parts)):
-                extra.add("/".join(parts[:i]))
-        all_folders |= extra
-
-        # Строим иерархию: parent → children
-        children: dict[str, list[str]] = defaultdict(list)
-        for f in sorted(all_folders):
-            if not f:
-                continue
-            parent = "/".join(f.split("/")[:-1])
-            children[parent].append(f)
-
-        def add_subtree(node, folder_key: str) -> None:
-            for child_key in children.get(folder_key, []):
-                name = child_key.split("/")[-1]
-                # Считаем файлы в этой папке (включая вложенные)
-                n = sum(
-                    len(v) for k, v in self._folder_tree.items()
-                    if k == child_key or k.startswith(child_key + "/")
-                )
-                label = f"[папка] {name}  [{n}]"
-                child_node = node.add(label, data=child_key)
-                add_subtree(child_node, child_key)
-
-        add_subtree(tree.root, "")
-
-        # Обновляем корневой лейбл
-        root_n = len(self._folder_tree.get("", []))
-        tree.root.label = f"[корень]  [{root_n}]"
         tree.root.expand()
+        for folder in sorted(self._folder_actions.keys()):
+            n = len(self._folder_actions[folder])
+            tree.root.add_leaf(f"{folder}  [{n}]", data=folder)
 
-    # ── Клик по папке в дереве ────────────────────────────────────────────────
-
-    @on(Tree.NodeSelected, "#fm-folder-tree")
+    @on(Tree.NodeSelected, "#fm-tree")
     def _on_folder_selected(self, event: Tree.NodeSelected) -> None:
-        folder_key = event.node.data
-        if folder_key is not None:
-            self._current_folder = folder_key
-            self._show_folder(folder_key)
+        folder = event.node.data
+        if folder is None:
+            return
+        self._current_folder = folder
+        self._fill_table(folder)
 
-    def _show_folder(self, folder_key: str) -> None:
-        """Показывает файлы конкретной папки в таблице."""
-        # Обновляем заголовок правой панели
-        title_label = self.query_one("#fm-file-title", Label)
-        display = folder_key if folder_key else "[корень]"
-        title_label.update(f" Файлы: {display} ")
-
-        # Наполняем таблицу
+    def _fill_table(self, folder: str) -> None:
         t = self.query_one("#fm-table", DataTable)
         t.clear()
-        self._row_to_plan = []
-
-        indices = self._folder_tree.get(folder_key, [])
-        for plan_idx in indices:
-            action = self._plan[plan_idx]
-
-            # Применяем фильтр
-            if self._filter != "all" and action.action.value != self._filter:
-                continue
-
-            sel_mark = "✓" if plan_idx in self._selected else " "
-            style = ACTION_STYLE[action.action]
-            short = ACTION_SHORT[action.action]
-            desc  = ACTION_DESC[action.action]
-            fname = action.rel_path.name
-            size  = _fmt_size(_real_size(action))
-            fi    = action.src_file or action.dst_file
-            cat   = fi.category if fi else ""
-
+        actions = self._folder_actions.get(folder, [])
+        for a in actions:
+            rel = str(a.rel_path)
+            mark = "✓" if rel in self._selected_paths else " "
+            style = ACTION_STYLE.get(a.action, "")
             t.add_row(
-                Text(sel_mark, style="bold ansi_bright_green" if plan_idx in self._selected else ""),
-                Text(short, style=style),
-                Text(desc,  style=style),
-                Text(fname),
-                Text(size),
-                Text(cat),
+                mark,
+                Text(ACTION_LABEL.get(a.action, a.action.value), style=style),
+                a.rel_path.name,
+                _fmt_size(a.size_bytes),
+                key=rel,
             )
-            self._row_to_plan.append(plan_idx)
+        self._update_selected_label()
 
-        self._update_sel_info()
+    def _update_selected_label(self) -> None:
+        self.query_one("#fm-selected-label", Label).update(f"Выбрано: {len(self._selected_paths)}")
 
-    # ── Выбор строк ───────────────────────────────────────────────────────────
+    # ── Выбор файлов ─────────────────────────────────────────────────────────
 
     def action_toggle_select(self) -> None:
         t = self.query_one("#fm-table", DataTable)
-        row = t.cursor_row
-        if row < len(self._row_to_plan):
-            idx = self._row_to_plan[row]
-            if idx in self._selected:
-                self._selected.discard(idx)
+        if t.cursor_row < 0 or not self._current_folder:
+            return
+        actions = self._folder_actions.get(self._current_folder, [])
+        if t.cursor_row >= len(actions):
+            return
+        rel = str(actions[t.cursor_row].rel_path)
+        if rel in self._selected_paths:
+            self._selected_paths.discard(rel)
+        else:
+            self._selected_paths.add(rel)
+        self._fill_table(self._current_folder)
+
+    def action_select_all_folder(self) -> None:
+        if not self._current_folder:
+            return
+        for a in self._folder_actions.get(self._current_folder, []):
+            self._selected_paths.add(str(a.rel_path))
+        self._fill_table(self._current_folder)
+
+    # ── Применение действий к выбранным ─────────────────────────────────────
+
+    def _apply_action_to_selected(self, new_action: ActionType,
+                                  protection: ProtectionLevel = ProtectionLevel.NONE,
+                                  reason: str = "вручную") -> None:
+        """
+        Применяет действие к выбранным файлам.
+
+        Раньше делало два полных прохода по всему плану: один здесь чтобы
+        построить new_plan, и ещё один внутри _build_folder_index(). На
+        планах в десятки тысяч файлов это давало заметную задержку UI на
+        каждый клик по кнопке действия. Теперь — один проход: rel_path
+        (а значит и папка) не меняется при замене action/protection_level,
+        так что можно обновить SyncAction прямо по месту в индексе без
+        пересборки всей структуры с нуля.
+        """
+        if not self._selected_paths:
+            self.notify("Сначала выберите файлы (Space)", severity="warning")
+            return
+        count = 0
+        new_plan = []
+        for a in self._plan:
+            rel = str(a.rel_path)
+            if rel in self._selected_paths:
+                new_a = dataclasses.replace(
+                    a, action=new_action, protection_level=protection, reason=reason, confirmed=0
+                )
+                new_plan.append(new_a)
+                count += 1
+
+                # Обновляем индекс по месту — папка та же, меняем только сам элемент
+                folder = str(a.rel_path.parent) if a.rel_path.parent != Path(".") else "(корень)"
+                bucket = self._folder_actions.get(folder)
+                if bucket is not None:
+                    # Поиск по identity (is), а не по значению (==) — нам нужен
+                    # именно ЭТОТ объект, а не любой "равный по содержимому";
+                    # для dataclass с вложенным FileInfo это и быстрее, и точнее
+                    for idx, existing in enumerate(bucket):
+                        if existing is a:
+                            bucket[idx] = new_a
+                            break
             else:
-                self._selected.add(idx)
-            self._show_folder(self._current_folder)
-            try:
-                t.move_cursor(row=row)
-            except Exception:
-                pass
-
-    def action_select_all(self) -> None:
-        """Выбрать все файлы в текущей папке (с учётом фильтра)."""
-        for idx in self._row_to_plan:
-            self._selected.add(idx)
-        self._show_folder(self._current_folder)
-
-    @on(Button.Pressed, "#btn-sel-all")
-    def _sel_all(self): self.action_select_all()
-
-    @on(Button.Pressed, "#btn-sel-none")
-    def _sel_none(self):
-        self._selected.clear()
-        self._show_folder(self._current_folder)
-
-    def _update_sel_info(self) -> None:
-        n = len(self._selected)
-        mb = sum(_real_size(self._plan[i]) for i in self._selected) / (1024 * 1024)
-        try:
-            self.query_one("#sel-info", Label).update(
-                f"Выбрано: [bold]{n}[/] файлов  ({mb:.1f} MB)"
-            )
-        except Exception:
-            pass
-
-    # ── Фильтр ────────────────────────────────────────────────────────────────
-
-    @on(Select.Changed, "#fm-filter")
-    def _on_filter(self, event: Select.Changed) -> None:
-        self._filter = str(event.value)
-        self._selected.clear()
-        self._show_folder(self._current_folder)
-
-    # ── Применение действий к выбранным ──────────────────────────────────────
+                new_plan.append(a)
+        self._plan = new_plan
+        if self._current_folder:
+            self._fill_table(self._current_folder)
+        self._fill_tree()
+        self.query_one("#fm-footer-status", Label).update(f"Изменено {count} файлов")
 
     @on(Button.Pressed, "#act-copy")
-    def _act_copy(self):    self._apply(ActionType.COPY_NEW)
+    def _act_copy(self) -> None:
+        self._apply_action_to_selected(ActionType.COPY_NEW, reason="вручную: копировать")
+
     @on(Button.Pressed, "#act-skip")
-    def _act_skip(self):    self._apply(ActionType.SKIP_EQUAL)
+    def _act_skip(self) -> None:
+        self._apply_action_to_selected(ActionType.SKIP_EQUAL, reason="вручную: пропустить")
+
     @on(Button.Pressed, "#act-protect")
-    def _act_protect(self): self._apply(ActionType.SKIP_PROTECTED)
-    @on(Button.Pressed, "#act-backup")
-    def _act_backup(self):  self._apply(ActionType.DELETE)
-
-    def _apply(self, new_type: ActionType) -> None:
-        if not self._selected:
-            self.notify("Сначала выберите файлы (Пробел или кнопка 'Выбрать все')", severity="warning")
-            return
-        for idx in list(self._selected):
-            self._plan[idx] = _change_action(self._plan[idx], new_type)
-        n = len(self._selected)
-        self._selected.clear()
-        self._rebuild_folder_tree()
-        self._show_folder(self._current_folder)
-        self.notify(f"Применено к {n} файлам: {ACTION_SHORT[new_type]}", severity="information")
-
-    # ── Двойной клик / Enter — один файл ─────────────────────────────────────
-
-    @on(DataTable.RowSelected, "#fm-table")
-    def _on_row_selected(self, event: DataTable.RowSelected) -> None:
-        row = event.cursor_row
-        if row >= len(self._row_to_plan):
-            return
-        plan_idx = self._row_to_plan[row]
-        self.app.push_screen(
-            SingleFileActionScreen(self._plan[plan_idx]),
-            lambda result, idx=plan_idx: self._on_single_done(idx, result)
+    def _act_protect(self) -> None:
+        self._apply_action_to_selected(
+            ActionType.SKIP_PROTECTED, protection=ProtectionLevel.SINGLE,
+            reason="вручную: защищён"
         )
 
-    def _on_single_done(self, plan_idx: int, new_type: Optional[ActionType]) -> None:
-        if new_type is not None:
-            self._plan[plan_idx] = _change_action(self._plan[plan_idx], new_type)
-            self._rebuild_folder_tree()
-            self._show_folder(self._current_folder)
+    @on(Button.Pressed, "#act-backup")
+    def _act_backup(self) -> None:
+        self._apply_action_to_selected(ActionType.DELETE, reason="вручную: в backup")
 
-    # ── Сохранить правила защиты навсегда ─────────────────────────────────────
+    @on(Button.Pressed, "#act-save-rules")
+    def _save_rules(self) -> None:
+        """
+        Сохраняет выбранные файлы как правила защиты в профиль.
 
-    @on(Button.Pressed, "#btn-save")
-    def _save_protection(self) -> None:
-        protected = [a for a in self._plan if a.action == ActionType.SKIP_PROTECTED]
-        if not protected:
-            self.notify("Нет защищённых файлов", severity="warning")
+        Паттерн строится по ПОЛНОМУ относительному пути файла, а не только
+        по имени. Раньше использовался только rel.name ("*report.pdf*"),
+        из-за чего правило защищало report.pdf в ЛЮБОЙ папке всего дерева
+        синхронизации, а не только выбранный конкретный файл — это могло
+        неожиданно заблокировать синхронизацию совершенно других файлов
+        с тем же именем.
+        """
+        if not self._selected_paths:
+            self.notify("Сначала выберите файлы", severity="warning")
             return
-
-        existing = {r.pattern for r in self._profile.protection_rules}
         added = 0
-        for a in protected:
-            pattern = f"*{a.rel_path.name}*"
-            if pattern not in existing:
+        existing_patterns = {r.pattern for r in self._profile.protection_rules}
+        for rel in self._selected_paths:
+            # Полный путь от корня синхронизации, нормализованный к posix-виду —
+            # защищает именно этот файл в этом месте, а не файл с таким же именем где угодно
+            pattern = Path(rel).as_posix()
+            if pattern not in existing_patterns:
                 self._profile.protection_rules.append(
                     ProtectionRule(pattern=pattern, level=ProtectionLevel.SINGLE,
-                                   description="добавлен вручную")
+                                   description="добавлено вручную из Управления файлами")
                 )
-                existing.add(pattern)
+                existing_patterns.add(pattern)
                 added += 1
-
-        if added:
-            from infrastructure.storage import load_profiles, save_profiles
+        try:
             profiles = load_profiles()
             profiles[self._profile.name] = self._profile
             save_profiles(profiles)
-            self.notify(
-                f"Сохранено {added} правил защиты.\n"
-                f"При следующем сканировании они применятся автоматически.",
-                severity="information", timeout=6,
-            )
-        else:
-            self.notify("Все правила уже сохранены", severity="information")
+            self.notify(f"Добавлено {added} правил защиты в профиль '{self._profile.name}'",
+                       severity="information")
+        except Exception as e:
+            self.notify(f"Ошибка сохранения: {e}", severity="error")
 
-    # ── Применить / отмена ────────────────────────────────────────────────────
+    # ── Закрытие ─────────────────────────────────────────────────────────────
 
     @on(Button.Pressed, "#btn-apply")
-    def _apply_all(self) -> None:
+    def _apply(self) -> None:
         self.dismiss(self._plan)
 
     @on(Button.Pressed, "#btn-cancel")
-    def action_do_cancel(self) -> None:
+    def _cancel(self) -> None:
         self.dismiss(None)
