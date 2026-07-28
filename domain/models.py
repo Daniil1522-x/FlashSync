@@ -1,6 +1,3 @@
-"""
-domain/models.py
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -8,13 +5,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-MTIME_TOLERANCE = 2.0  # секунды
+MTIME_TOLERANCE = 2.0
 
 
 class ActionType(Enum):
     COPY_NEW       = "copy_new"
     COPY_UPDATE    = "copy_update"
     DELETE         = "delete"
+    DELETE_PERM    = "delete_permanent"
     SKIP_EQUAL     = "skip_equal"
     SKIP_PROTECTED = "skip_protected"
 
@@ -53,7 +51,6 @@ class FileInfo:
     def is_same_as(self, other: "FileInfo", use_hash: bool = True) -> bool:
         if use_hash and self.hash is not None and other.hash is not None:
             return self.hash == other.hash
-        # fallback: размер + дата
         return self.size == other.size and abs(self.mtime - other.mtime) < MTIME_TOLERANCE
 
 
@@ -69,22 +66,26 @@ class SyncAction:
     @property
     def rel_path(self) -> Path:
         f = self.src_file or self.dst_file
-        assert f is not None, "SyncAction: нет ни src_file ни dst_file"
+        if f is None:
+            raise ValueError("SyncAction must have at least src_file or dst_file set")
         return f.rel_path
 
     @property
     def size_bytes(self) -> int:
         if self.action in (ActionType.COPY_NEW, ActionType.COPY_UPDATE):
             return self.src_file.size if self.src_file else 0
-        if self.action == ActionType.DELETE:
-            return self.dst_file.size if self.dst_file else 0
+        if self.action in (ActionType.DELETE, ActionType.DELETE_PERM):
+            if self.dst_file:
+                return self.dst_file.size
+            if self.src_file:
+                return self.src_file.size
+            return 0
         return 0
 
     def needs_confirmation(self) -> bool:
         return self.protection_level != ProtectionLevel.NONE
 
     def confirm(self) -> bool:
-        """True = достаточно подтверждений для выполнения."""
         self.confirmed += 1
         return self.confirmed >= self.protection_level.value
 
@@ -97,9 +98,10 @@ class SyncReport:
     actions_skipped: list[SyncAction] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    log_lines: list[str] = field(default_factory=list)   # строки для Dry Run лога
+    log_lines: list[str] = field(default_factory=list)
     bytes_copied: int = 0
     bytes_backed_up: int = 0
+    bytes_deleted_perm: int = 0
 
     @property
     def duration_seconds(self) -> float:
@@ -127,15 +129,12 @@ class ProtectionRule:
 
     def matches(self, rel_path: Path) -> bool:
         import fnmatch
-        # as_posix() — всегда прямые слеши, работает на Windows и Linux одинаково
         name = rel_path.as_posix().lower()
         pat = self.pattern.lower()
         if "*" in pat or "?" in pat or "[" in pat:
             if "/" not in pat:
-                # паттерн без слеша — сравниваем только имя файла
                 return fnmatch.fnmatch(rel_path.name.lower(), pat)
             return fnmatch.fnmatch(name, pat)
-        # простое вхождение
         return pat in name
 
 
@@ -165,9 +164,48 @@ _EXT_MAP = {
     "temp":     {".tmp", ".log", ".bak", ".old", ".cache", ".swp"},
 }
 
+
 def _classify(ext: str) -> str:
     ext = ext.lower()
     for cat, exts in _EXT_MAP.items():
         if ext in exts:
             return cat
     return "other"
+
+
+def validate_sync_paths(src: Path, dst: Path) -> Optional[str]:
+    """
+    Проверяет что src и dst не пересекаются — иначе сканер видит содержимое
+    dst как часть src (или наоборот), и при каждой синхронизации backup-папка
+    копируется сама в себя на уровень глубже (Backup/Backup/Backup/...),
+    бесконтрольно съедая место, плюс реальные файлы могут попасть под DELETE
+    по ошибке. Частый сценарий: src=E:\\, dst=E:\\Backup (папка ВНУТРИ флешки).
+
+    Возвращает текст ошибки, либо None если пути безопасны для синхронизации.
+    """
+    try:
+        src_r = src.resolve()
+        dst_r = dst.resolve()
+    except OSError:
+        return None  # не можем проверить (например путь ещё не существует) — пропускаем
+
+    if src_r == dst_r:
+        return "Источник и приёмник — один и тот же путь. Синхронизация не имеет смысла."
+
+    try:
+        if dst_r.is_relative_to(src_r):
+            return (f"Приёмник ({dst}) находится ВНУТРИ источника ({src}). "
+                    f"Это приведёт к бесконтрольному копированию backup-папки самой в себя. "
+                    f"Выберите приёмник вне дерева источника.")
+    except ValueError:
+        pass
+
+    try:
+        if src_r.is_relative_to(dst_r):
+            return (f"Источник ({src}) находится ВНУТРИ приёмника ({dst}). "
+                    f"При включённом удалении это может стереть часть приёмника, "
+                    f"не относящуюся к источнику. Выберите источник вне дерева приёмника.")
+    except ValueError:
+        pass
+
+    return None

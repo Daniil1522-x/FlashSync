@@ -1,19 +1,15 @@
-"""
-infrastructure/hasher.py
-"""
 from __future__ import annotations
 import asyncio
 import hashlib
 from pathlib import Path
 from typing import Optional
 
-MTIME_TOLERANCE = 2.0  # секунды — допуск для сравнения дат
+MTIME_TOLERANCE = 2.0
 
 
 def hash_file(path: Path, algo: str = "sha256", block_size: int = 1024 * 1024) -> Optional[str]:
-    """Возвращает хеш файла или None при ошибке чтения."""
     if algo not in hashlib.algorithms_available:
-        raise ValueError(f"Неизвестный алгоритм: {algo}")
+        raise ValueError(f"Unknown algo: {algo}")
     h = hashlib.new(algo)
     try:
         with open(path, "rb") as f:
@@ -21,11 +17,10 @@ def hash_file(path: Path, algo: str = "sha256", block_size: int = 1024 * 1024) -
                 h.update(chunk)
         return h.hexdigest()
     except OSError:
-        return None  # явный None вместо "" — два файла с ошибкой не будут считаться одинаковыми
+        return None
 
 
 async def hash_file_async(path: Path, algo: str = "sha256") -> Optional[str]:
-    """Асинхронная версия — не блокирует event loop."""
     return await asyncio.to_thread(hash_file, path, algo)
 
 
@@ -45,7 +40,6 @@ def verify_copy(src: Path, dst: Path, algo: str = "sha256") -> bool:
 
 
 def quick_diff(src: Path, dst: Path) -> bool:
-    """Быстрое сравнение без хеша."""
     try:
         ss = src.stat()
         ds = dst.stat()

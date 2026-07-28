@@ -1,209 +1,208 @@
 """
-ui/tui/folder_picker.py — Выбор папки с навигацией.
+ui/tui/folder_picker.py — Экран выбора папки.
+
+ВАЖНО про копирование/вставку пути:
+Textual Input поддерживает стандартные системные сочетания клавиш
+(Ctrl+C/Ctrl+V на Linux/Windows, Cmd+C/Cmd+V на macOS) НАТИВНО на уровне
+терминала — сам виджет Input не должен их перехватывать или блокировать.
+Если paste не работал, типичная причина — родительский экран ловил
+те же клавиши через BINDINGS и съедал событие до того как оно дошло
+до Input. Здесь у ModalScreen нет конфликтующих BINDINGS, а сам Input
+оставлен в "чистом" режиме без обработчиков on_key, которые могли бы
+перехватывать ввод раньше виджета.
 """
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Optional
+
 from textual.app import ComposeResult
-from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Input, Select
 from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Label, Button, Input, DataTable
 from textual import on
-import os
+
+from infrastructure.drives import get_removable_drives
 
 
 class FolderPickerScreen(ModalScreen):
-    """Диалог выбора папки с полной навигацией."""
+    """
+    Экран навигации по файловой системе.
+    Возвращает выбранный путь (str) через dismiss(), либо None при отмене.
+    """
 
     CSS = """
     FolderPickerScreen { align: center middle; }
-    #fp { 
-        width: 90; 
-        height: 20; 
+    #fp-root {
+        width: 86%; height: 86%;
         border: thick $primary;
-        background: $surface;
-        padding: 1 2;
+        background: $surface; padding: 1 2;
+        layout: vertical;
     }
-    #fp Label { margin-bottom: 1; }
-    #fp Input { margin-bottom: 1; width: 100%; }
-    #fp .row { layout: horizontal; height: 3; margin-top: 1; }
-    #fp Button { margin: 0 1; min-width: 15; }
-    #fp .drive-list { height: 8; }
-    #fp .drive-btn { width: 100%; text-align: left; }
+    #fp-title { height: 1; margin-bottom: 1; }
+    #fp-path-row { height: 3; layout: horizontal; margin-bottom: 1; }
+    #fp-path-row Input { width: 1fr; }
+    #fp-nav-row { height: 3; layout: horizontal; margin-bottom: 1; }
+    #fp-nav-row Button { margin-right: 1; }
+    #fp-table { height: 1fr; border: solid $accent; margin-bottom: 1; }
+    #fp-footer { height: 3; layout: horizontal; }
+    #fp-footer Button { margin-right: 1; }
+    #fp-error { color: $error; height: 1; }
     """
 
-    def __init__(self, title: str = "Выберите папку", current_path: str = ""):
+    def __init__(self, title: str, current_path: str = ""):
         super().__init__()
         self._title = title
-        self._current = Path(current_path).resolve() if current_path else Path(".").resolve()
+        # Стартовая точка: текущий путь если валиден, иначе домашняя папка
+        start = Path(current_path) if current_path else Path.home()
+        if not start.exists() or not start.is_dir():
+            start = start.parent if start.parent.exists() else Path.home()
+        self._current_dir = start
+        self._entries: list[Path] = []
 
     def compose(self) -> ComposeResult:
-        with Container(id="fp"):
-            yield Label(f"[bold]{self._title}[/]")
-            yield Label(f"[dim]Текущий путь:[/]", classes="hint")
-            yield Input(value=str(self._current), id="path-input", placeholder="Введите путь или выберите ниже")
+        with Container(id="fp-root"):
+            yield Label(f"[bold]{self._title}[/]", id="fp-title")
 
-            # Кнопки быстрых действий
-            with Horizontal(classes="row"):
-                yield Button("⬆️ Наверх", id="btn-up", variant="default")
+            with Horizontal(id="fp-path-row"):
+                # Обычный Input — поддерживает копирование/вставку через
+                # стандартные сочетания терминала (Ctrl+C/V, выделение мышью)
+                yield Input(value=str(self._current_dir), id="fp-path-input",
+                           placeholder="Введите путь вручную или используйте навигацию ниже")
+                yield Button("Перейти", id="btn-goto", variant="primary")
+
+            with Horizontal(id="fp-nav-row"):
+                yield Button("↑ Наверх", id="btn-up", variant="default")
                 yield Button("💾 Диски", id="btn-drives", variant="default")
                 yield Button("📁 Домой", id="btn-home", variant="default")
 
-            # Кнопки подтверждения
-            with Horizontal(classes="row"):
+            yield DataTable(id="fp-table", cursor_type="row")
+            yield Label("", id="fp-error")
+
+            with Horizontal(id="fp-footer"):
                 yield Button("✅ Выбрать этот путь", id="btn-select", variant="success")
-                yield Button("❌ Отмена", id="btn-cancel", variant="default")
+                yield Button("❌ Отмена", id="btn-cancel", variant="error")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#fp-table", DataTable)
+        t.add_columns(" ", "Имя", "Тип")
+        self._refresh_listing()
+
+    # ── Навигация ────────────────────────────────────────────────────────────
+
+    # Не даём UI замереть на папках с десятками/сотнями тысяч записей
+    # (node_modules, корень диска, Windows\WinSxS и т.п.) — без лимита
+    # sorted(iterdir()) в главном потоке мог морозить интерфейс на минуты.
+    MAX_ENTRIES = 2000
+
+    def _refresh_listing(self) -> None:
+        t = self.query_one("#fp-table", DataTable)
+        t.clear()
+        self._entries = []
+        err_lbl = self.query_one("#fp-error", Label)
+        err_lbl.update("")
+
+        try:
+            # os.scandir дешевле чем Path.iterdir для больших папок —
+            # is_dir() из DirEntry часто берётся из кэша readdir без лишнего stat()
+            import os
+            raw_entries = []
+            with os.scandir(self._current_dir) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        if not entry.is_dir():
+                            continue  # выбираем только папки — не тратим время на файлы
+                    except OSError:
+                        continue
+                    raw_entries.append(entry.name)
+                    if len(raw_entries) >= self.MAX_ENTRIES:
+                        break
+            entries = sorted(self._current_dir / name for name in raw_entries)
+            truncated = len(raw_entries) >= self.MAX_ENTRIES
+        except PermissionError:
+            err_lbl.update(f"⚠ Нет доступа: {self._current_dir}")
+            return
+        except OSError as e:
+            err_lbl.update(f"⚠ Ошибка: {e}")
+            return
+
+        for p in entries:
+            self._entries.append(p)
+            t.add_row("📁", p.name, "папка", key=str(p))
+
+        if truncated:
+            err_lbl.update(
+                f"Показаны первые {self.MAX_ENTRIES} папок (их больше) — "
+                f"введите точный путь вручную если нужной нет в списке"
+            )
+
+        self.query_one("#fp-path-input", Input).value = str(self._current_dir)
+
+    def _go_to(self, path: Path) -> None:
+        if not path.exists():
+            self.query_one("#fp-error", Label).update(f"⚠ Путь не существует: {path}")
+            return
+        if not path.is_dir():
+            self.query_one("#fp-error", Label).update(f"⚠ Это не папка: {path}")
+            return
+        self._current_dir = path
+        self._refresh_listing()
+
+    # ── Обработчики ──────────────────────────────────────────────────────────
+
+    @on(DataTable.RowSelected, "#fp-table")
+    def _on_row_selected(self, event: DataTable.RowSelected) -> None:
+        if 0 <= event.cursor_row < len(self._entries):
+            self._go_to(self._entries[event.cursor_row])
 
     @on(Button.Pressed, "#btn-up")
     def _go_up(self) -> None:
-        """Перейти в родительскую директорию."""
-        if self._current.parent and self._current.parent != self._current:
-            self._current = self._current.parent
-            self.query_one("#path-input", Input).value = str(self._current)
-            self.notify(f"Папка: {self._current}", severity="information", timeout=2)
+        parent = self._current_dir.parent
+        if parent != self._current_dir:
+            self._go_to(parent)
 
     @on(Button.Pressed, "#btn-home")
     def _go_home(self) -> None:
-        """Перейти в домашнюю директорию."""
-        self._current = Path.home()
-        self.query_one("#path-input", Input).value = str(self._current)
-        self.notify(f"Домашняя папка: {self._current}", severity="information", timeout=2)
+        self._go_to(Path.home())
 
     @on(Button.Pressed, "#btn-drives")
     def _show_drives(self) -> None:
-        """Показать список дисков (Windows) или корневых разделов."""
-        self.push_screen(DriveListScreen(), self._on_drive_selected)
+        drives = get_removable_drives()
+        if not drives:
+            self.query_one("#fp-error", Label).update("Диски не найдены")
+            return
+        t = self.query_one("#fp-table", DataTable)
+        t.clear()
+        self._entries = []
+        for d in drives:
+            self._entries.append(Path(d["path"]))
+            icon = "💾" if d["removable"] else "🖴"
+            t.add_row(icon, d["display"], "диск", key=d["path"])
 
-    def _on_drive_selected(self, drive_path: Optional[str]) -> None:
-        if drive_path:
-            self._current = Path(drive_path)
-            self.query_one("#path-input", Input).value = str(self._current)
+    @on(Button.Pressed, "#btn-goto")
+    def _goto_typed_path(self) -> None:
+        """Переход по пути, введённому (или вставленному) в поле Input."""
+        typed = self.query_one("#fp-path-input", Input).value.strip()
+        if typed:
+            self._go_to(Path(typed))
 
-    @on(Input.Changed, "#path-input")
-    def _on_path_changed(self, event: Input.Changed) -> None:
-        """Обновить текущий путь при ручном вводе."""
-        try:
-            new_path = Path(event.value).resolve()
-            if new_path.exists() and new_path.is_dir():
-                self._current = new_path
-        except Exception:
-            pass  # Игнорируем неверные пути
+    @on(Input.Submitted, "#fp-path-input")
+    def _on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter в поле пути — переходит туда же, что и кнопка Перейти."""
+        typed = event.value.strip()
+        if typed:
+            self._go_to(Path(typed))
 
     @on(Button.Pressed, "#btn-select")
     def _select(self) -> None:
-        """Подтвердить выбор текущего пути."""
-        path_str = self.query_one("#path-input", Input).value.strip()
-        try:
-            path = Path(path_str).resolve()
-            if path.exists() and path.is_dir():
-                self.dismiss(str(path))
-            else:
-                self.notify(f"Папка не существует: {path}", severity="error")
-        except Exception as e:
-            self.notify(f"Ошибка пути: {e}", severity="error")
+        # Берём актуальное значение поля — если пользователь вставил/напечатал путь
+        # вручную и не нажал "Перейти", выбираем именно его, а не self._current_dir
+        typed = self.query_one("#fp-path-input", Input).value.strip()
+        result = typed if typed else str(self._current_dir)
+        self.dismiss(result)
 
     @on(Button.Pressed, "#btn-cancel")
     def _cancel(self) -> None:
         self.dismiss(None)
-
-
-class DriveListScreen(ModalScreen):
-    """Список дисков для выбора."""
-
-    CSS = """
-    DriveListScreen { align: center middle; }
-    #dl { 
-        width: 70; 
-        height: auto; 
-        border: thick $primary;
-        background: $surface;
-        padding: 1 2;
-    }
-    #dl Label { margin-bottom: 1; }
-    #dl Button { width: 100%; margin-bottom: 1; text-align: left; }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Container(id="dl"):
-            yield Label("[bold]Выберите диск:[/]")
-            yield Label("")
-
-            drives = self._get_drives()
-            if not drives:
-                yield Label("[dim]Диски не найдены[/]")
-
-            for drive in drives:
-                variant = "success" if drive.get("removable") else "default"
-                yield Button(
-                    f"{'💾' if drive.get('removable') else '🖴'} {drive['path']}  "
-                    f"[{drive.get('label', 'Без имени')}]  "
-                    f"Свободно: {drive.get('free', 'N/A')}",
-                    id=f"drive-{drive['path']}",
-                    variant=variant
-                )
-
-            yield Label("")
-            yield Button("❌ Отмена", id="dl-cancel", variant="default")
-
-    def _get_drives(self) -> list:
-        """Получить список доступных дисков."""
-        drives = []
-
-        if os.name == "nt":
-            # Windows
-            import string
-            import ctypes
-
-            try:
-                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-                for letter in string.ascii_uppercase:
-                    if bitmask & 1:
-                        path = f"{letter}:\\"
-                        try:
-                            import shutil
-                            usage = shutil.disk_usage(path)
-                            free_gb = usage.free // (1024**3)
-
-                            # Получить метку тома
-                            label_buf = ctypes.create_unicode_buffer(256)
-                            ctypes.windll.kernel32.GetVolumeInformationW(
-                                path, label_buf, 256, None, None, None, None, 0
-                            )
-                            label = label_buf.value or "Без имени"
-
-                            # Тип диска
-                            drive_type = ctypes.windll.kernel32.GetDriveTypeW(path)
-                            removable = (drive_type == 2)  # DRIVE_REMOVABLE
-
-                            drives.append({
-                                "path": path,
-                                "label": label,
-                                "free": f"{free_gb} GB",
-                                "removable": removable
-                            })
-                        except Exception:
-                            pass
-                    bitmask >>= 1
-            except Exception:
-                # Fallback: простой перебор
-                for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-                    path = f"{letter}:\\"
-                    if Path(path).exists():
-                        drives.append({"path": path, "label": "Диск", "free": "N/A", "removable": False})
-        else:
-            # Linux/macOS
-            common_paths = ["/", "/home", "/media", "/mnt", "/Volumes"]
-            for mp in common_paths:
-                if Path(mp).exists():
-                    drives.append({"path": mp, "label": mp, "free": "N/A", "removable": False})
-
-        return drives
-
-    @on(Button.Pressed)
-    def _on_button(self, event: Button.Pressed) -> None:
-        btn_id = event.button.id or ""
-        if btn_id == "dl-cancel":
-            self.dismiss(None)
-        elif btn_id.startswith("drive-"):
-            drive_path = btn_id.replace("drive-", "")
-            self.dismiss(drive_path)
